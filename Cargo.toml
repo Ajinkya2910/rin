@@ -1,0 +1,65 @@
+# Cargo.toml - Rust's project manifest
+# Think of this like package.json (Node) or pyproject.toml (Python)
+# It defines your project metadata, dependencies, and build settings.
+
+[package]
+name = "rv"                          # The binary name: users will type `rv resolve DESeq2`
+version = "0.1.0"                    # Semantic versioning
+edition = "2021"                     # Rust edition (like Python 3.x vs 2.x)
+description = "Fast R package manager for life sciences"
+license = "MIT"
+repository = "https://github.com/yourusername/rv"
+
+# [[bin]] tells Cargo this project produces an executable binary, not a library.
+# When you run `cargo build`, it creates `target/debug/rv`
+[[bin]]
+name = "rv"
+path = "src/main.rs"
+
+[dependencies]
+# --- CLI Framework ---
+# clap: The standard Rust CLI parser. Derive macros let you define
+# CLI arguments as a struct (like argparse in Python but type-safe).
+clap = { version = "4", features = ["derive"] }
+
+# --- Async Runtime ---
+# tokio: Rust's async runtime. Needed for non-blocking HTTP requests.
+# Think of it like asyncio in Python.
+tokio = { version = "1", features = ["full"] }
+
+# --- HTTP Client ---
+# reqwest: HTTP client (like Python's requests library).
+# We need it to download PACKAGES files from CRAN/Bioconductor.
+reqwest = { version = "0.12", features = ["gzip", "json"] }
+
+# --- Serialization ---
+# serde: Rust's serialization framework (like json module in Python).
+# "derive" feature lets you add #[derive(Serialize, Deserialize)]
+# to structs and they automatically become serializable.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# --- Error Handling ---
+# anyhow: Simplified error handling. Without it, Rust's error system
+# is very explicit (good for libraries, verbose for applications).
+# anyhow lets you use `?` operator everywhere and get nice error messages.
+anyhow = "1"
+
+# --- Pretty Terminal Output ---
+# colored: Simple terminal colors (like Python's colorama)
+colored = "2"
+indicatif = "0.17"                   # Progress bars
+
+# --- Compression ---
+# flate2: For decompressing PACKAGES.gz files from CRAN
+flate2 = "1"
+
+# --- Parallel Processing ---
+# rayon: Data parallelism library. Makes parallel compilation trivial.
+# `items.par_iter().for_each(|item| compile(item))` — that's it.
+rayon = "1"
+
+[dev-dependencies]
+# These are only used in tests (like pytest in Python)
+tempfile = "3"                       # Create temp directories for testing

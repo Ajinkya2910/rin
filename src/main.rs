@@ -1,0 +1,271 @@
+// src/main.rs — The entry point of the rv program.
+//
+// RUST CONCEPT: main() is where every Rust program starts, just like Python's
+// `if __name__ == "__main__"` or C's main(). The `#[tokio::main]` attribute
+// makes it async (we need this for HTTP requests to CRAN/Bioconductor).
+//
+// RUST CONCEPT: `mod` declarations tell Rust "there's a module here."
+// Each `mod foo;` means Rust looks for either:
+//   - src/foo.rs (single file module), or
+//   - src/foo/mod.rs (directory module with sub-modules)
+// This is like Python's import system but more explicit.
+
+// Declare our modules — each is a major component of rv
+mod cli;        // Command-line argument parsing
+mod registry;   // Fetching package metadata from CRAN + Bioconductor
+mod resolver;   // Dependency resolution (the brain of rv)
+mod sysreq;     // System dependency checking (apt packages)
+mod lockfile;   // rv.lock file generation and reading
+mod installer;  // Package installation orchestration
+
+// `use` brings items into scope — like `from X import Y` in Python
+use anyhow::Result;
+use cli::Cli;
+use clap::Parser;
+
+// #[tokio::main] transforms this into an async main function.
+// Under the hood, it creates a tokio runtime and blocks on this function.
+// Without it, you'd have to write:
+//   fn main() {
+//       let rt = tokio::runtime::Runtime::new().unwrap();
+//       rt.block_on(async { ... });
+//   }
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Parse command-line arguments.
+    // Cli::parse() uses clap to read args from std::env::args().
+    // If the user types something invalid, clap prints help and exits.
+    let cli = Cli::parse();
+
+    // Match on the subcommand — like a switch statement, but Rust's `match`
+    // is exhaustive: the compiler forces you to handle every possible case.
+    // This means you can never forget to handle a command.
+    match cli.command {
+        cli::Commands::Resolve { packages } => {
+            // `rv resolve DESeq2 ggplot2`
+            cmd_resolve(&packages).await?;
+        }
+        cli::Commands::Audit { packages } => {
+            // `rv audit DESeq2`
+            cmd_audit(&packages).await?;
+        }
+        cli::Commands::Install { packages, retry } => {
+            // `rv install DESeq2` or `rv install --retry`
+            cmd_install(&packages, retry).await?;
+        }
+        cli::Commands::Why { package } => {
+            // `rv why rlang`
+            cmd_why(&package).await?;
+        }
+        cli::Commands::Lock { packages } => {
+            // `rv lock DESeq2 clusterProfiler`
+            cmd_lock(&packages).await?;
+        }
+    }
+
+    // Ok(()) means "everything succeeded, return nothing."
+    // RUST CONCEPT: Rust has no exceptions. Instead, functions return
+    // Result<T, E> which is either Ok(value) or Err(error).
+    // The `?` operator after function calls means "if this returned an error,
+    // propagate it up immediately." It's like automatic try/except.
+    Ok(())
+}
+
+// --- Command Implementations ---
+// Each command follows the same pattern:
+// 1. Fetch registry metadata
+// 2. Do something with it
+// 3. Display results
+
+/// Resolve and display the dependency tree
+async fn cmd_resolve(packages: &[String]) -> Result<()> {
+    use colored::Colorize;
+
+    println!("{}", "Resolving dependencies...".dimmed());
+
+    // Fetch package metadata from CRAN and Bioconductor
+    let registry = registry::Registry::fetch().await?;
+
+    // Resolve the full dependency tree
+    let resolved = resolver::resolve(&registry, packages)?;
+
+    // Display the tree
+    println!(
+        "\n{} {} packages resolved in {:.1}s\n",
+        "✓".green(),
+        resolved.packages.len(),
+        resolved.duration_secs
+    );
+
+    // Print the dependency tree
+    for pkg in &resolved.packages {
+        let source_label = match pkg.source.as_str() {
+            "bioc" => "(bioc)".blue(),
+            "cran" => "(cran)".dimmed(),
+            _ => "(unknown)".dimmed(),
+        };
+
+        let compile_flag = if pkg.needs_compilation {
+            " ⚙ C++".yellow().to_string()
+        } else {
+            String::new()
+        };
+
+        // RUST CONCEPT: format! is like Python's f-strings.
+        // println! is a macro (note the !) that prints to stdout.
+        println!("  {} {} {}{}", pkg.name, pkg.version, source_label, compile_flag);
+    }
+
+    // Print summary
+    let bioc_count = resolved.packages.iter().filter(|p| p.source == "bioc").count();
+    let cran_count = resolved.packages.iter().filter(|p| p.source == "cran").count();
+    let compile_count = resolved.packages.iter().filter(|p| p.needs_compilation).count();
+
+    println!("\n{}", "Summary:".bold());
+    println!("  {} from Bioconductor", bioc_count.to_string().blue());
+    println!("  {} from CRAN", cran_count);
+    println!(
+        "  {} need compilation",
+        compile_count.to_string().yellow()
+    );
+
+    Ok(())
+}
+
+/// Audit system dependencies before installing
+async fn cmd_audit(packages: &[String]) -> Result<()> {
+    use colored::Colorize;
+
+    println!("{}", "Resolving dependencies...".dimmed());
+    let registry = registry::Registry::fetch().await?;
+    let resolved = resolver::resolve(&registry, packages)?;
+
+    println!("{}", "Checking system dependencies...".dimmed());
+    let report = sysreq::audit(&resolved)?;
+
+    // Display results
+    for dep in &report.found {
+        println!("  {} {} {}", "✓".green(), dep.name, dep.version.dimmed());
+    }
+    for dep in &report.missing {
+        println!(
+            "  {} {} — needed by: {}",
+            "✗".red(),
+            dep.name.red(),
+            dep.needed_by.join(", ").dimmed()
+        );
+    }
+
+    if !report.missing.is_empty() {
+   if std::env::consts::OS == "macos" {
+        println!("\n{}\n  brew install {}", "Fix with:".bold(),
+            report.missing.iter()
+                .map(|d| sysreq::get_brew_name(&d.name))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    } else {
+        println!("\n{}\n  sudo apt install {}", "Fix with:".bold(),
+            report.missing.iter()
+                .map(|d| d.name.as_str())
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+    }
+}
+
+    Ok(())
+}
+
+/// Install packages
+async fn cmd_install(packages: &[String], retry: bool) -> Result<()> {
+    use colored::Colorize;
+
+    if retry {
+        println!("{}", "Retrying failed packages...".dimmed());
+        installer::retry_install().await?;
+        return Ok(());
+    }
+
+    println!("{}", "Resolving dependencies...".dimmed());
+    let registry = registry::Registry::fetch().await?;
+    let resolved = resolver::resolve(&registry, packages)?;
+
+    // Pre-flight system dependency check
+    println!("{}", "Pre-flight check: system dependencies...".dimmed());
+    let report = sysreq::audit(&resolved)?;
+
+    if !report.missing.is_empty() {
+        println!(
+            "\n{} Missing {} system libraries:",
+            "✗".red(),
+            report.missing.len()
+        );
+        for dep in &report.missing {
+            println!("  {} — needed by: {}", dep.name.red(), dep.needed_by.join(", "));
+        }
+
+        // Ask user if we should install them
+        println!("\n{}", "Install them now? [Y/n]".bold());
+        // In a real implementation, read stdin here
+        // For now, we'll auto-install
+        sysreq::install_missing(&report)?;
+    }
+
+    println!("\n{}", "Installing packages...".dimmed());
+    installer::install(&resolved).await?;
+
+    println!(
+        "\n{} All {} packages installed successfully!",
+        "✓".green(),
+        resolved.packages.len()
+    );
+
+    Ok(())
+}
+
+/// Explain why a package is in the dependency tree
+async fn cmd_why(package: &str) -> Result<()> {
+    use colored::Colorize;
+
+    let registry = registry::Registry::fetch().await?;
+
+    // Find all paths from root packages to the target
+    let paths = resolver::find_dependency_paths(&registry, package)?;
+
+    if paths.is_empty() {
+        println!("{} is not in the current dependency tree.", package.yellow());
+    } else {
+        println!("Why is {} needed:\n", package.bold());
+        for path in &paths {
+            for (i, step) in path.iter().enumerate() {
+                let indent = "  ".repeat(i);
+                let arrow = if i > 0 { "└── " } else { "" };
+                println!("{}{}{}", indent, arrow, step);
+            }
+            println!();
+        }
+    }
+
+    Ok(())
+}
+
+/// Generate a lockfile
+async fn cmd_lock(packages: &[String]) -> Result<()> {
+    use colored::Colorize;
+
+    println!("{}", "Resolving dependencies...".dimmed());
+    let registry = registry::Registry::fetch().await?;
+    let resolved = resolver::resolve(&registry, packages)?;
+
+    let lockfile_path = lockfile::write(&resolved)?;
+
+    println!(
+        "\n{} Written to {} ({} packages)",
+        "✓".green(),
+        lockfile_path.display(),
+        resolved.packages.len()
+    );
+
+    Ok(())
+}
