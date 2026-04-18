@@ -214,7 +214,7 @@ mod tests {
         // BiocGenerics (no deps — leaf node)
         packages.insert(
             "BiocGenerics".to_string(),
-            PackageMetadata {
+            vec![PackageMetadata {
                 name: "BiocGenerics".to_string(),
                 version: "0.48.1".to_string(),
                 source: PackageSource::Bioconductor,
@@ -223,13 +223,13 @@ mod tests {
                 linking_to: vec![],
                 needs_compilation: false,
                 system_requirements: None,
-            },
+            }],
         );
 
         // S4Vectors depends on BiocGenerics
         packages.insert(
             "S4Vectors".to_string(),
-            PackageMetadata {
+            vec![PackageMetadata {
                 name: "S4Vectors".to_string(),
                 version: "0.40.2".to_string(),
                 source: PackageSource::Bioconductor,
@@ -241,13 +241,13 @@ mod tests {
                 linking_to: vec![],
                 needs_compilation: true,
                 system_requirements: None,
-            },
+            }],
         );
 
         // IRanges depends on S4Vectors
         packages.insert(
             "IRanges".to_string(),
-            PackageMetadata {
+            vec![PackageMetadata {
                 name: "IRanges".to_string(),
                 version: "2.36.0".to_string(),
                 source: PackageSource::Bioconductor,
@@ -259,7 +259,7 @@ mod tests {
                 linking_to: vec![],
                 needs_compilation: true,
                 system_requirements: None,
-            },
+            }],
         );
 
         Registry {
