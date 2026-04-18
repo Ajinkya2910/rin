@@ -155,7 +155,7 @@ fn parse_single_entry(entry: &str, source: &PackageSource) -> Option<PackageMeta
 fn parse_dependency_list(input: &str) -> Vec<Dependency> {
     // Base R packages that are always available — we skip these
     const BASE_PACKAGES: &[&str] = &[
-        "R", "base", "compiler", "datasets", "grDevices", "graphics",
+         "base", "compiler", "datasets", "grDevices", "graphics",
         "grid", "methods", "parallel", "splines", "stats", "stats4",
         "tcltk", "tools", "utils",
     ];
@@ -207,11 +207,12 @@ mod tests {
         let deps = parse_dependency_list(input);
 
         // "R" and "methods" are base packages — should be filtered out
-        assert_eq!(deps.len(), 2);
-        assert_eq!(deps[0].name, "BiocGenerics");
-        assert_eq!(deps[0].version_req, Some(">= 0.44.0".to_string()));
-        assert_eq!(deps[1].name, "ggplot2");
-        assert_eq!(deps[1].version_req, None);
+        assert_eq!(deps[0].name, "R");
+        assert_eq!(deps[0].version_req, Some(">= 4.4.0".to_string()));
+        assert_eq!(deps[1].name, "BiocGenerics");
+        assert_eq!(deps[1].version_req, Some(">= 0.44.0".to_string()));
+        assert_eq!(deps[2].name, "ggplot2");
+        assert_eq!(deps[2].version_req, None);
     }
 
     #[test]

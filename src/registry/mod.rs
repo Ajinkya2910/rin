@@ -295,6 +295,9 @@ async fn fetch_and_parse(url: &str, source: PackageSource) -> Result<Vec<Package
 
 /// Detect the installed R version by running `R --version`
 fn detect_r_version() -> Result<String> {
+    // TEMPORARY: fake old R version to test constraint checking
+       //return Ok("4.3.0".to_string());
+
     use std::process::Command;
 
     // RUST CONCEPT: std::process::Command

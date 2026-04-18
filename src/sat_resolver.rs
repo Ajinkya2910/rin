@@ -238,6 +238,23 @@ fn collect_with_constraints(
 
     // Process Depends — collect names AND constraints
     for dep in &metadata.depends {
+         if dep.name == "R" {
+            // Don't add R as a package to install, but DO check the constraint
+            if let Some(ref ver_req) = dep.version_req {
+                if let Some(constraint) = VersionConstraint::parse(ver_req) {
+                    let r_version = RVersion::parse(&registry.r_version);
+                    if let Some(ref rv) = r_version {
+                        if !constraint.satisfies(rv) {
+                            anyhow::bail!(
+                                "Package '{}' requires R {}, but you have R {}",
+                                pkg_name, ver_req, registry.r_version
+                            );
+                        }
+                    }
+                }
+            }
+            continue; // Don't add R to dep_names
+        }
         dep_names.push(dep.name.clone());
         if let Some(ref ver_req) = dep.version_req {
             if let Some(constraint) = VersionConstraint::parse(ver_req) {
