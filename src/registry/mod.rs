@@ -104,9 +104,10 @@ pub struct Dependency {
 /// The complete registry: all packages from all sources
 #[derive(Debug)]
 pub struct Registry {
-    /// All packages indexed by name for fast lookup
-    /// HashMap is like Python's dict
-    pub packages: HashMap<String, PackageMetadata>,
+    /// All packages indexed by name, each with one or more versions
+    /// (sorted newest first). Currently only latest from CRAN/Bioc,
+    /// but Archive versions can be added later.
+    pub packages: HashMap<String, Vec<PackageMetadata>>,
 
     /// R version detected on this system
     pub r_version: String,
@@ -164,19 +165,18 @@ impl Registry {
         // RUST CONCEPT: `mut` — variables are immutable by default in Rust.
         // You must explicitly say `mut` to allow modification.
         // This prevents accidental mutations and makes code easier to reason about.
-        let mut packages = HashMap::new();
+        let mut packages: HashMap<String, Vec<PackageMetadata>> = HashMap::new();
 
         for pkg in cran_packages {
-            packages.insert(pkg.name.clone(), pkg);
+            packages.entry(pkg.name.clone()).or_default().push(pkg);
         }
 
-        // Bioconductor packages override CRAN if same name exists
-        // (some packages exist in both, Bioc version takes priority)
+        // Bioconductor packages go first (higher priority)
         for pkg in bioc_packages {
-            packages.insert(pkg.name.clone(), pkg);
+            packages.entry(pkg.name.clone()).or_default().insert(0, pkg);
         }
         for pkg in bioc_annotation {
-            packages.insert(pkg.name.clone(), pkg);
+            packages.entry(pkg.name.clone()).or_default().insert(0, pkg);
         }
 
         println!(
@@ -197,8 +197,77 @@ impl Registry {
     /// This returns Option<&PackageMetadata> — either Some(&package) or None.
     /// The `&` means we're returning a reference (borrow), not a copy.
     /// The caller can read the data but doesn't own it.
+    /// Look up a package by name — returns the latest/best version
     pub fn get(&self, name: &str) -> Option<&PackageMetadata> {
+        self.packages.get(name).and_then(|versions| versions.first())
+    }
+    /// Get all available versions of a package (for backtracking resolver)
+    pub fn get_all_versions(&self, name: &str) -> Option<&Vec<PackageMetadata>> {
         self.packages.get(name)
+    }
+    /// Fetch archived versions of a package from CRAN Archive.
+    /// Returns versions sorted newest first.
+    pub async fn fetch_archive_versions(&mut self, pkg_name: &str) -> Result<Vec<PackageMetadata>> {
+        let url = format!(
+            "https://cloud.r-project.org/src/contrib/Archive/{}/",
+            pkg_name
+        );
+
+        let response = reqwest::get(&url).await;
+
+        let body = match response {
+            Ok(resp) if resp.status().is_success() => {
+                resp.text().await.unwrap_or_default()
+            }
+            _ => return Ok(Vec::new()), // No archive exists
+        };
+
+        // Parse the HTML listing for .tar.gz files
+        // Lines look like: <a href="rlang_1.0.0.tar.gz">rlang_1.0.0.tar.gz</a>
+        let mut versions: Vec<PackageMetadata> = Vec::new();
+
+        for line in body.lines() {
+            // Look for href="pkgname_version.tar.gz"
+            let pattern = format!("{}_", pkg_name);
+            if let Some(start) = line.find(&pattern) {
+                let rest = &line[start + pattern.len()..];
+                if let Some(end) = rest.find(".tar.gz") {
+                    let version_str = &rest[..end];
+
+                    // Create a minimal PackageMetadata for this archived version
+                    // We don't have full dependency info — we'd need to download
+                    // and parse each tarball's DESCRIPTION for that.
+                    // For now, clone the latest version's metadata but swap the version.
+                    if let Some(latest) = self.get(pkg_name) {
+                        let mut archived = latest.clone();
+                        archived.version = version_str.to_string();
+                        versions.push(archived);
+                    }
+                }
+            }
+        }
+
+        // Sort newest first using our RVersion comparison
+        versions.sort_by(|a, b| {
+            let va = crate::version::RVersion::parse(&a.version);
+            let vb = crate::version::RVersion::parse(&b.version);
+            match (va, vb) {
+                (Some(a), Some(b)) => b.cmp(&a), // reverse: newest first
+                _ => std::cmp::Ordering::Equal,
+            }
+        });
+
+        // Add to our registry for future lookups
+        if !versions.is_empty() {
+            let entry = self.packages.entry(pkg_name.to_string()).or_default();
+            for v in &versions {
+                if !entry.iter().any(|existing| existing.version == v.version) {
+                    entry.push(v.clone());
+                }
+            }
+        }
+
+        Ok(versions)
     }
 }
 
