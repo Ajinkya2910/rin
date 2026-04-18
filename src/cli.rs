@@ -85,4 +85,8 @@ pub enum Commands {
         #[arg(required = true)]
         packages: Vec<String>,
     },
+    /// Restore packages from an rv.lock file
+    ///
+    /// Example: rv restore
+    Restore,
 }

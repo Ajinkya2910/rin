@@ -17,7 +17,8 @@ mod resolver;   // Dependency resolution (the brain of rv)
 mod sysreq;     // System dependency checking (apt packages)
 mod lockfile;   // rv.lock file generation and reading
 mod installer;  // Package installation orchestration
-
+mod version;
+mod sat_resolver;
 // `use` brings items into scope — like `from X import Y` in Python
 use anyhow::Result;
 use cli::Cli;
@@ -61,6 +62,9 @@ async fn main() -> Result<()> {
             // `rv lock DESeq2 clusterProfiler`
             cmd_lock(&packages).await?;
         }
+        cli::Commands::Restore => {
+            cmd_restore().await?;
+        }
     }
 
     // Ok(()) means "everything succeeded, return nothing."
@@ -84,10 +88,10 @@ async fn cmd_resolve(packages: &[String]) -> Result<()> {
     println!("{}", "Resolving dependencies...".dimmed());
 
     // Fetch package metadata from CRAN and Bioconductor
-    let registry = registry::Registry::fetch().await?;
+    let mut registry = registry::Registry::fetch().await?;
 
     // Resolve the full dependency tree
-    let resolved = resolver::resolve(&registry, packages)?;
+    let resolved = sat_resolver::resolve_with_constraints(&mut registry, packages).await?;
 
     // Display the tree
     println!(
@@ -137,8 +141,8 @@ async fn cmd_audit(packages: &[String]) -> Result<()> {
     use colored::Colorize;
 
     println!("{}", "Resolving dependencies...".dimmed());
-    let registry = registry::Registry::fetch().await?;
-    let resolved = resolver::resolve(&registry, packages)?;
+    let mut registry = registry::Registry::fetch().await?;
+    let resolved = sat_resolver::resolve_with_constraints(&mut registry, packages).await?;
 
     println!("{}", "Checking system dependencies...".dimmed());
     let report = sysreq::audit(&resolved)?;
@@ -188,8 +192,8 @@ async fn cmd_install(packages: &[String], retry: bool) -> Result<()> {
     }
 
     println!("{}", "Resolving dependencies...".dimmed());
-    let registry = registry::Registry::fetch().await?;
-    let resolved = resolver::resolve(&registry, packages)?;
+    let mut registry = registry::Registry::fetch().await?;
+    let resolved = sat_resolver::resolve_with_constraints(&mut registry, packages).await?;
 
     // Pre-flight system dependency check
     println!("{}", "Pre-flight check: system dependencies...".dimmed());
@@ -213,7 +217,7 @@ async fn cmd_install(packages: &[String], retry: bool) -> Result<()> {
     }
 
     println!("\n{}", "Installing packages...".dimmed());
-    installer::install(&resolved).await?;
+    installer::install(&resolved,&registry.bioc_version).await?;
 
     println!(
         "\n{} All {} packages installed successfully!",
@@ -228,7 +232,7 @@ async fn cmd_install(packages: &[String], retry: bool) -> Result<()> {
 async fn cmd_why(package: &str) -> Result<()> {
     use colored::Colorize;
 
-    let registry = registry::Registry::fetch().await?;
+    let mut registry = registry::Registry::fetch().await?;
 
     // Find all paths from root packages to the target
     let paths = resolver::find_dependency_paths(&registry, package)?;
@@ -255,8 +259,8 @@ async fn cmd_lock(packages: &[String]) -> Result<()> {
     use colored::Colorize;
 
     println!("{}", "Resolving dependencies...".dimmed());
-    let registry = registry::Registry::fetch().await?;
-    let resolved = resolver::resolve(&registry, packages)?;
+    let mut registry = registry::Registry::fetch().await?;
+    let resolved = sat_resolver::resolve_with_constraints(&mut registry, packages).await?;
 
     let lockfile_path = lockfile::write(&resolved)?;
 
@@ -264,6 +268,74 @@ async fn cmd_lock(packages: &[String]) -> Result<()> {
         "\n{} Written to {} ({} packages)",
         "✓".green(),
         lockfile_path.display(),
+        resolved.packages.len()
+    );
+
+    Ok(())
+}
+/// Restore packages from rv.lock
+async fn cmd_restore() -> Result<()> {
+    use colored::Colorize;
+
+    // Read the lockfile
+    println!("{}", "Reading rv.lock...".dimmed());
+    let lockfile = lockfile::read("rv.lock")?;
+
+    println!(
+        "  Found {} packages for R {} / Bioconductor {}",
+        lockfile.packages.len(),
+        lockfile.metadata.r_version,
+        lockfile.metadata.bioc_version
+    );
+
+    // Convert locked packages into ResolvedPackages for the installer
+    let resolved = resolver::ResolvedDeps {
+        packages: lockfile
+            .packages
+            .iter()
+            .map(|pkg| resolver::ResolvedPackage {
+                name: pkg.name.clone(),
+                version: pkg.version.clone(),
+                source: pkg.source.clone(),
+                needs_compilation: false, // We don't store this in lockfile yet
+                dependencies: pkg.deps.clone(),
+                sha256: pkg.sha256.clone(),
+            })
+            .collect(),
+        duration_secs: 0.0,
+    };
+
+    // Check what's already installed at the right version
+    println!("{}", "Checking installed packages...".dimmed());
+    let already_installed = installer::check_installed_versions(&resolved.packages);
+
+    let to_install: Vec<&resolver::ResolvedPackage> = resolved
+        .packages
+        .iter()
+        .filter(|pkg| !already_installed.contains(&pkg.name))
+        .collect();
+
+    if to_install.is_empty() {
+        println!(
+            "\n{} All {} packages already installed at correct versions.",
+            "✓".green(),
+            resolved.packages.len()
+        );
+        return Ok(());
+    }
+
+    println!(
+        "\n  {} already installed, {} to install",
+        already_installed.len(),
+        to_install.len()
+    );
+
+    // Install missing packages
+    installer::install(&resolved,&lockfile.metadata.bioc_version).await?;
+
+    println!(
+        "\n{} Environment restored from rv.lock ({} packages)",
+        "✓".green(),
         resolved.packages.len()
     );
 
