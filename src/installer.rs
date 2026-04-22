@@ -265,11 +265,17 @@ fn install_single_package(pkg: &ResolvedPackage, bioc_version: &str) -> Result<(
 
 
     // Install using R CMD INSTALL
-    let output = Command::new("R")
-        .args(["CMD", "INSTALL", "--no-test-load"])
-        .arg(&tarball_path)
-        .output()
-        .context("R is not installed")?;
+    // Use project-local library if .rv/lib/ exists
+     let lib_arg = get_venv_lib().map(|p| format!("--library={}", p.display()));
+
+    let mut cmd = Command::new("R");
+    cmd.args(["CMD", "INSTALL", "--no-test-load"]);
+    if let Some(ref lib) = lib_arg {
+        cmd.arg(lib);
+    }
+    cmd.arg(&tarball_path);
+
+    let output = cmd.output().context("R is not installed")?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -329,12 +335,37 @@ fn parse_compile_error(stderr: &str) -> String {
     format!("Compilation error: {}", last_error.trim())
 }
 
+/// Get the active venv library path, if any
+fn get_venv_lib() -> Option<std::path::PathBuf> {
+    // First check if venv is activated via environment variable
+    if let Ok(path) = std::env::var("RV_VENV") {
+        let lib_path = std::path::PathBuf::from(path).join("lib");
+        if lib_path.exists() {
+            return Some(lib_path);
+        }
+    }
+    // Fallback: check if .rv/lib exists in current directory
+    let local = std::path::PathBuf::from(".rv/lib");
+    if local.exists() {
+        return Some(std::fs::canonicalize(&local).unwrap_or(local));
+    }
+    None
+}
+
 /// Check which packages from the resolved set are already installed
 pub fn check_installed_versions(packages: &[ResolvedPackage]) -> Vec<String> {
-    // Run R to get installed packages WITH their versions
+
+    let r_code = if let Some(venv_path) = get_venv_lib() {
+        format!(
+            "ip <- installed.packages(lib.loc='{}'); cat(paste(ip[,'Package'], ip[,'Version']), sep='\\n')",
+            venv_path.display()
+        )
+    } else {
+        "ip <- installed.packages(); cat(paste(ip[,'Package'], ip[,'Version']), sep='\\n')".to_string()
+    };
+
     let output = Command::new("R")
-        .args(["--vanilla", "--slave", "-e", 
-               "ip <- installed.packages(); cat(paste(ip[,'Package'], ip[,'Version']), sep='\\n')"])
+        .args(["--vanilla", "--slave", "-e", &r_code])
         .output();
 
     match output {

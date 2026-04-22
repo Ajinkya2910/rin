@@ -65,6 +65,15 @@ async fn main() -> Result<()> {
         cli::Commands::Restore => {
             cmd_restore().await?;
         }
+         cli::Commands::Venv { path, r_version } => {
+            cmd_venv_create(&path, r_version).await?;
+        }
+        cli::Commands::VenvInfo => {
+            cmd_venv_info()?;
+        }
+        cli::Commands::VenvRemove { path } => {
+            cmd_venv_remove(&path)?;
+        }
     }
 
     // Ok(()) means "everything succeeded, return nothing."
@@ -341,3 +350,155 @@ async fn cmd_restore() -> Result<()> {
 
     Ok(())
 }
+
+/// Create a virtual environment
+async fn cmd_venv_create(path: &str, r_version: Option<String>) -> Result<()> {
+    use colored::Colorize;
+
+    let venv_dir = std::path::PathBuf::from(path);
+    let lib_dir = venv_dir.join("lib");
+
+    if lib_dir.exists() {
+        println!("{} Virtual environment already exists at {}/", "✓".green(), path);
+        return Ok(());
+    }
+
+    // Determine R version
+    let r_ver = match r_version {
+        Some(v) => v,
+        None => {
+            // Auto-detect from system
+            let output = std::process::Command::new("R")
+                .args(["--vanilla", "--slave", "-e", "cat(paste0(R.version$major, '.', R.version$minor))"])
+                .output();
+            match output {
+                Ok(out) if out.status.success() => {
+                    String::from_utf8_lossy(&out.stdout).trim().to_string()
+                }
+                _ => {
+                    anyhow::bail!("R not found. Specify R version manually: rv venv --r-version 4.4.0");
+                }
+            }
+        }
+    };
+
+    // Create directories
+    std::fs::create_dir_all(&lib_dir)?;
+
+    // Write config file
+    let config = format!(
+        "# rv virtual environment\n\
+         r_version = \"{}\"\n\
+         created = \"{}\"\n",
+        r_ver,
+        lockfile::chrono_now()
+    );
+    std::fs::write(venv_dir.join("config.toml"), config)?;
+
+    // Write activate script (bash/zsh)
+    let abs_lib = std::fs::canonicalize(&lib_dir).unwrap_or(lib_dir.clone());
+    let abs_venv = std::fs::canonicalize(&venv_dir).unwrap_or(venv_dir.clone());
+
+    let activate_content = format!(
+        r#"#!/bin/sh
+# rv virtual environment activation script
+# Usage: source {path}/activate
+
+# Save old values for deactivate
+export _RV_OLD_R_LIBS_USER="${{R_LIBS_USER:-}}"
+export _RV_OLD_PS1="${{PS1:-}}"
+
+# Set the library path
+export R_LIBS_USER="{lib}"
+export RV_VENV="{venv}"
+
+# Update prompt to show active environment
+export PS1="(rv:{name}) $PS1"
+
+# Define deactivate function
+deactivate() {{
+    export R_LIBS_USER="$_RV_OLD_R_LIBS_USER"
+    export PS1="$_RV_OLD_PS1"
+    unset RV_VENV
+    unset _RV_OLD_R_LIBS_USER
+    unset _RV_OLD_PS1
+    unset -f deactivate
+    echo "rv environment deactivated"
+}}
+
+echo "rv environment active (R {r_ver})"
+echo "  Library: {lib}"
+echo "  Deactivate: deactivate"
+"#,
+        path = path,
+        lib = abs_lib.display(),
+        venv = abs_venv.display(),
+        name = venv_dir.file_name().unwrap_or_default().to_string_lossy(),
+        r_ver = r_ver
+    );
+    std::fs::write(venv_dir.join("activate"), activate_content)?;
+
+    // Write .gitignore for the venv
+    std::fs::write(venv_dir.join(".gitignore"), "lib/\n")?;
+
+    println!("{} Created virtual environment at {}/", "✓".green(), path);
+    println!("  R version: {}", r_ver);
+    println!("  Library:   {}/lib/", path);
+    println!(
+        "\n  To activate:\n    {}",
+        format!("source {}/activate", path).bold()
+    );
+    println!(
+        "  To deactivate:\n    {}",
+        "deactivate".bold()
+    );
+
+    Ok(())
+}
+
+/// Show info about active virtual environment
+fn cmd_venv_info() -> Result<()> {
+    use colored::Colorize;
+
+    match std::env::var("RV_VENV") {
+        Ok(path) => {
+            let lib_path = std::path::PathBuf::from(&path);
+            let count = std::fs::read_dir(&lib_path)
+                .map(|entries| entries.filter(|e| e.is_ok()).count())
+                .unwrap_or(0);
+
+            println!("  Active environment: {}", path);
+            println!("  Packages installed: {}", count);
+            println!("  Deactivate: deactivate");
+        }
+        Err(_) => {
+            // Check if .rv exists but isn't activated
+            if std::path::Path::new(".rv/lib").exists() {
+                println!("{} Virtual environment exists but is not activated", "!".yellow());
+                println!("  Run: source .rv/activate");
+            } else {
+                println!("{} No virtual environment found", "✗".red());
+                println!("  Run: rv venv");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Remove a virtual environment
+fn cmd_venv_remove(path: &str) -> Result<()> {
+    use colored::Colorize;
+
+    let venv_dir = std::path::PathBuf::from(path);
+    if venv_dir.exists() {
+        std::fs::remove_dir_all(&venv_dir)?;
+        println!("{} Removed {}/", "✓".green(), path);
+    } else {
+        println!("{} No virtual environment at {}/", "✗".red(), path);
+    }
+
+    Ok(())
+}
+
+

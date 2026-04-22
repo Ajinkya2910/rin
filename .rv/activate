@@ -1,0 +1,29 @@
+#!/bin/sh
+# rv virtual environment activation script
+# Usage: source .rv/activate
+
+# Save old values for deactivate
+export _RV_OLD_R_LIBS_USER="${R_LIBS_USER:-}"
+export _RV_OLD_PS1="${PS1:-}"
+
+# Set the library path
+export R_LIBS_USER="/Users/apatil/Documents/rv/.rv/lib"
+export RV_VENV="/Users/apatil/Documents/rv/.rv"
+
+# Update prompt to show active environment
+export PS1="(rv:.rv) $PS1"
+
+# Define deactivate function
+deactivate() {
+    export R_LIBS_USER="$_RV_OLD_R_LIBS_USER"
+    export PS1="$_RV_OLD_PS1"
+    unset RV_VENV
+    unset _RV_OLD_R_LIBS_USER
+    unset _RV_OLD_PS1
+    unset -f deactivate
+    echo "rv environment deactivated"
+}
+
+echo "rv environment active (R 4.4.1)"
+echo "  Library: /Users/apatil/Documents/rv/.rv/lib"
+echo "  Deactivate: deactivate"

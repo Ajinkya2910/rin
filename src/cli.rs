@@ -89,4 +89,29 @@ pub enum Commands {
     ///
     /// Example: rv restore
     Restore,
+       /// Create and manage project-local R library
+    ///
+    /// Example: rv venv
+    /// Example: rv venv my-project
+    /// Example: rv venv --r-version 4.4.0
+    Venv {
+        /// Name or path for the virtual environment (default: .rv)
+        #[arg(default_value = ".rv")]
+        path: String,
+
+        /// R version to use (default: auto-detect)
+        #[arg(long)]
+        r_version: Option<String>,
+    },
+
+    /// Show info about the active virtual environment
+    VenvInfo,
+
+    /// Remove a virtual environment
+    VenvRemove {
+        /// Path to the virtual environment to remove (default: .rv)
+        #[arg(default_value = ".rv")]
+        path: String,
+    },
 }
+

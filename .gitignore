@@ -5,3 +5,5 @@
 target/debug/rv.d
 target/debug/rv.d
 target/debug/rv
+my-project/config.toml
+my-project/activate

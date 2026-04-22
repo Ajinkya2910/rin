@@ -140,7 +140,7 @@ pub fn read(path: impl AsRef<Path>) -> Result<Lockfile> {
 }
 
 /// Simple timestamp function (avoids adding chrono dependency for MVP)
-fn chrono_now() -> String {
+pub fn chrono_now() -> String {
     // RUST CONCEPT: SystemTime for timestamps
     // For a proper implementation, you'd use the `chrono` crate.
     // For MVP, we use a Unix timestamp.
