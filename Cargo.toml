@@ -8,7 +8,7 @@ version = "0.1.0"                    # Semantic versioning
 edition = "2021"                     # Rust edition (like Python 3.x vs 2.x)
 description = "Fast R package manager for life sciences"
 license = "MIT"
-repository = "https://github.com/yourusername/rv"
+repository = "https://github.com/Ajinkya2910/rv"
 
 # [[bin]] tells Cargo this project produces an executable binary, not a library.
 # When you run `cargo build`, it creates `target/debug/rv`
@@ -21,6 +21,8 @@ path = "src/main.rs"
 # clap: The standard Rust CLI parser. Derive macros let you define
 # CLI arguments as a struct (like argparse in Python but type-safe).
 clap = { version = "4", features = ["derive"] }
+resolvo = "0.8"
+semver = "1"
 
 # --- Async Runtime ---
 # tokio: Rust's async runtime. Needed for non-blocking HTTP requests.
