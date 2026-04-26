@@ -19,6 +19,7 @@ mod lockfile;   // rv.lock file generation and reading
 mod installer;  // Package installation orchestration
 mod version;
 mod sat_resolver;
+mod source;
 // `use` brings items into scope — like `from X import Y` in Python
 use anyhow::Result;
 use cli::Cli;
@@ -155,7 +156,7 @@ async fn cmd_audit(packages: &[String]) -> Result<()> {
 
     println!("{}", "Checking system dependencies...".dimmed());
     let report = sysreq::audit(&resolved)?;
-
+    
     // Display results
     for dep in &report.found {
         println!("  {} {} {}", "✓".green(), dep.name, dep.version.dimmed());
@@ -168,7 +169,7 @@ async fn cmd_audit(packages: &[String]) -> Result<()> {
             dep.needed_by.join(", ").dimmed()
         );
     }
-
+    
     if !report.missing.is_empty() {
    if std::env::consts::OS == "macos" {
         println!("\n{}\n  brew install {}", "Fix with:".bold(),
@@ -186,6 +187,23 @@ async fn cmd_audit(packages: &[String]) -> Result<()> {
         );
     }
 }
+// Offer to fix Makevars if needed
+    if let Some(fix) = sysreq::check_makevars() {
+        println!(
+            "\n{} R's Fortran paths are misconfigured:",
+            "⚠".yellow()
+        );
+        println!("  R looks in:      {}", fix.bad_paths.join(", "));
+        println!("  gfortran is at:  {}", fix.correct_lib);
+        println!(
+            "\n  {} rv can fix this by writing to {}",
+            "→".blue(),
+            fix.makevars_path.display()
+        );
+        // Auto-fix for now; later you can add --fix flag
+        sysreq::fix_makevars(&fix)?;
+        println!("  {} Makevars updated!", "✓".green());
+    }
 
     Ok(())
 }
@@ -193,6 +211,26 @@ async fn cmd_audit(packages: &[String]) -> Result<()> {
 /// Install packages
 async fn cmd_install(packages: &[String], retry: bool) -> Result<()> {
     use colored::Colorize;
+
+    // Day 1: parse package specs (registry name vs. gh:user/repo). 
+    // Resolver wiring comes later — for now we just verify the parser
+    // and bail early if the user asked for a GitHub package.
+    if !retry {
+        let parsed: Vec<source::PackageSource> = packages
+            .iter()
+            .map(|s| source::PackageSource::parse(s))
+            .collect::<Result<Vec<_>>>()?;
+
+        for spec in &parsed {
+            println!("  parsed: {:?}", spec);
+        }
+
+        if parsed.iter().any(|p| matches!(p, source::PackageSource::GitHub(_))) {
+            anyhow::bail!(
+                "GitHub package support not yet implemented (Day 1: parser only)"
+            );
+        }
+    }
 
     if retry {
         println!("{}", "Retrying failed packages...".dimmed());
