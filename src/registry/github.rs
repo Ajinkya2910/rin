@@ -14,6 +14,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
+use crate::registry::{Dependency, PackageMeta};
 
 const REF_CACHE_TTL_SECS: u64 = 24 * 60 * 60; // refs can move; commit SHAs are eternal.
 
@@ -311,7 +312,147 @@ pub async fn download_tarball(
 
     Ok((tarball_path, digest))
 }
+// --- GitHub package metadata ------------------------------------------------
 
+/// Metadata for a GitHub-hosted package, parallel to PackageMetadata
+/// but tracking GitHub-specific provenance (owner, repo, commit SHA,
+/// tarball hash) for lockfile reproducibility.
+#[derive(Debug, Clone)]
+pub struct GitHubPackageMetadata {
+    pub name: String,
+    pub version: String,
+    pub depends: Vec<Dependency>,
+    pub imports: Vec<Dependency>,
+    pub linking_to: Vec<String>,
+    pub remotes: Vec<String>,
+    pub needs_compilation: bool,
+    pub system_requirements: Option<String>,
+
+    // GitHub-specific provenance — for lockfile and rv why output.
+    pub owner: String,
+    pub repo: String,
+    pub commit_sha: String,
+    pub subdir: Option<String>,
+    pub tarball_sha256: String,
+}
+
+impl PackageMeta for GitHubPackageMetadata {
+    fn name(&self) -> &str { &self.name }
+    fn version(&self) -> &str { &self.version }
+    fn depends(&self) -> &[Dependency] { &self.depends }
+    fn imports(&self) -> &[Dependency] { &self.imports }
+    fn linking_to(&self) -> &[String] { &self.linking_to }
+    fn needs_compilation(&self) -> bool { self.needs_compilation }
+    fn system_requirements(&self) -> Option<&str> {
+        self.system_requirements.as_deref()
+    }
+    fn source_label(&self) -> &'static str { "github" }
+}
+
+// --- DESCRIPTION extraction from a tarball ----------------------------------
+
+/// Pull the DESCRIPTION file out of a downloaded tarball.
+///
+/// GitHub tarballs unpack into a top-level directory whose name varies
+/// ({repo}-{sha}, {repo}-{tag}, sometimes truncated). We can't predict
+/// the prefix, so we scan entries for the first one whose path ends in
+/// `/DESCRIPTION` (or `/{subdir}/DESCRIPTION`) at the right depth.
+pub fn extract_description(tarball_path: &Path, subdir: Option<&str>) -> Result<String> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(tarball_path)?;
+    let gz = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+
+    let target_suffix = match subdir {
+        Some(sub) => format!("/{}/DESCRIPTION", sub.trim_matches('/')),
+        None => "/DESCRIPTION".to_string(),
+    };
+
+    // Expected path depth — how many '/' separators after the root dir.
+    // For "{root}/DESCRIPTION" → 1.
+    // For "{root}/sub/DESCRIPTION" → 2.
+    // For "{root}/projects/r/DESCRIPTION" → 3.
+    let expected_depth = match subdir {
+        Some(sub) => sub.split('/').filter(|s| !s.is_empty()).count() + 1,
+        None => 1,
+    };
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path_str = entry.path()?.to_string_lossy().into_owned();
+
+        if !path_str.ends_with(&target_suffix) {
+            continue;
+        }
+
+        // Reject DESCRIPTION files at the wrong depth — guards against
+        // picking up DESCRIPTION inside test fixtures, vignettes, etc.
+        let depth = path_str.split('/').count() - 1;
+        if depth != expected_depth {
+            continue;
+        }
+
+        let mut content = String::new();
+        entry.read_to_string(&mut content)?;
+        return Ok(content);
+    }
+
+    let suggestion = match subdir {
+        Some(s) => format!(
+            "\nThe subdir '{}' may be wrong. \
+             If the package is at the repo root, drop the subdir from the spec.",
+            s
+        ),
+        None => "\nIf the package is in a subdirectory, use 'gh:owner/repo/subdir'.".to_string(),
+    };
+    bail!("No DESCRIPTION found in tarball{}", suggestion);
+}
+
+// --- Top-level orchestration ------------------------------------------------
+
+/// Resolve + download + extract + parse, returning fully-populated metadata.
+///
+/// This is the function the resolver calls. Errors here surface to the user
+/// with all the context they need to fix the request.
+pub async fn fetch_metadata(
+    spec: &GitHubSpec,
+    cache_dir: &Path,
+    client: &reqwest::Client,
+) -> Result<GitHubPackageMetadata> {
+    let sha = resolve_ref(spec, cache_dir, client).await?;
+    let (tarball_path, sha256) = download_tarball(spec, &sha, cache_dir, client).await?;
+    let description_text = extract_description(&tarball_path, spec.subdir.as_deref())?;
+
+    let parsed = crate::registry::parser::parse_description(&description_text)?;
+
+    // GitHub packages MUST have a Version field. If they don't,
+    // R CMD INSTALL would fail anyway — surface the clearer error here.
+    let version = parsed.version.ok_or_else(|| {
+        anyhow!(
+            "GitHub package {}/{} has no Version: field in DESCRIPTION.\n\
+             rv requires GitHub packages to have a valid version. \
+             File an issue at the upstream repo.",
+            spec.owner, spec.repo
+        )
+    })?;
+
+    Ok(GitHubPackageMetadata {
+        name: parsed.name,
+        version,
+        depends: parsed.depends,
+        imports: parsed.imports,
+        linking_to: parsed.linking_to,
+        remotes: parsed.remotes,
+        needs_compilation: parsed.needs_compilation,
+        system_requirements: parsed.system_requirements,
+        owner: spec.owner.clone(),
+        repo: spec.repo.clone(),
+        commit_sha: sha,
+        subdir: spec.subdir.clone(),
+        tarball_sha256: sha256,
+    })
+}
 // --- Tests -----------------------------------------------------------------
 //
 // These hit the real network and require GITHUB_TOKEN to be set.
@@ -357,5 +498,40 @@ mod tests {
         let cache = test_cache_dir();
         let sha = resolve_ref(&spec, &cache, &client).await.unwrap();
         assert!(is_sha(&sha), "expected 40-char hex SHA, got: {}", sha);
+    }
+
+   #[tokio::test]
+    #[ignore] // hits the network
+    async fn test_fetch_metadata_real_package() {
+        let spec = GitHubSpec {
+            owner: "satijalab".to_string(),
+            repo: "seurat-data".to_string(),
+            r#ref: None,
+            subdir: None,
+        };
+        let client = reqwest::Client::new();
+        let cache = test_cache_dir();
+
+        let meta = fetch_metadata(&spec, &cache, &client).await.unwrap();
+
+        // Print first so we can see what we got, even if asserts fail.
+        println!("name:           {}", meta.name);
+        println!("version:        {}", meta.version);
+        println!("commit_sha:     {}", meta.commit_sha);
+        println!("tarball_sha256: {}", meta.tarball_sha256);
+        println!("depends:        {:?}",
+                 meta.depends.iter().map(|d| &d.name).collect::<Vec<_>>());
+        println!("imports:        {:?}",
+                 meta.imports.iter().map(|d| &d.name).collect::<Vec<_>>());
+        println!("remotes:        {:?}", meta.remotes);
+
+        // Structural assertions — these don't depend on what the package
+        // happens to declare, just that the pipeline produced sane data.
+        assert!(!meta.name.is_empty());
+        assert!(!meta.version.is_empty());
+        assert_eq!(meta.commit_sha.len(), 40);
+        assert_eq!(meta.tarball_sha256.len(), 64);
+        assert_eq!(meta.owner, "satijalab");
+        assert_eq!(meta.repo, "seurat-data");
     }
 }

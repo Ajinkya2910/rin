@@ -1,51 +1,80 @@
 // src/registry/parser.rs — Parses CRAN/Bioconductor PACKAGES format
+//                          and standalone DESCRIPTION files.
 //
 // The PACKAGES file is a flat-text database with entries separated by
-// blank lines. Each entry looks like:
+// blank lines. Each entry uses the same format as a standalone
+// DESCRIPTION file inside a package tarball.
 //
+// Shared shape:
 //   Package: DESeq2
 //   Version: 1.42.0
-//   Depends: R (>= 4.4.0), methods, stats, BiocGenerics (>= 0.44.0)
-//   Imports: GenomicRanges, SummarizedExperiment, Rcpp (>= 1.0.0)
+//   Depends: R (>= 4.4.0), methods, BiocGenerics (>= 0.44.0)
+//   Imports: GenomicRanges, Rcpp (>= 1.0.0)
 //   LinkingTo: Rcpp, RcppArmadillo
 //   NeedsCompilation: yes
 //   SystemRequirements: C++17
+//   Remotes: github::satijalab/seurat-data       <- DESCRIPTION-only
 //
-// Our job: parse this into Vec<PackageMetadata>.
-//
-// RUST CONCEPT: Iterators
-// Rust's iterators are one of its most powerful features. They're lazy
-// (like Python generators) and the compiler optimizes them into efficient
-// loops. The chain: .lines().filter().map().collect() compiles down to
-// a single efficient loop — no intermediate allocations.
+// We have two entry points:
+//   parse_packages(text)       → many entries from a PACKAGES index
+//   parse_description(text)    → one entry from a tarball's DESCRIPTION
+// Both share parse_fields() for the line-by-line key:value extraction.
 
 use super::{Dependency, PackageMetadata, PackageSource};
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use std::collections::HashMap;
 
-/// Parse the full PACKAGES file text into a list of package metadata
+// --- Shared field extraction ------------------------------------------------
+
+/// Parse the line-by-line "Key: Value" structure of one entry.
+/// Handles continuation lines (lines starting with whitespace).
 ///
-/// RUST CONCEPT: &str vs String
-///   - &str is a "string slice" — a reference to string data. Cheap, no allocation.
-///     Like a view/pointer. Used for function parameters (reading).
-///   - String is an "owned string" — heap-allocated, growable, you own it.
-///     Like Python's str. Used for storing data in structs.
-///
-/// Rule of thumb: take &str as input, return String when you need to store it.
+/// This is the part shared between PACKAGES entries and DESCRIPTION files —
+/// they have identical line-level syntax, only the field semantics differ.
+fn parse_fields(entry: &str) -> HashMap<String, String> {
+    let mut fields = HashMap::new();
+    let mut current_key = String::new();
+    let mut current_value = String::new();
+
+    for line in entry.lines() {
+        if line.starts_with(' ') || line.starts_with('\t') {
+            // Continuation of the current value.
+            // Don't prepend a space if the value is empty (multi-line field
+            // where the key line was just "Fieldname:" with no inline value).
+            if !current_value.is_empty() {
+                current_value.push(' ');
+            }
+            current_value.push_str(line.trim());
+        } else if let Some((key, value)) = line.split_once(':') {
+            // New field — flush the previous one.
+            // Match on bare ':' so we accept both "Key: value" and "Key:" (value follows on next lines).
+            if !current_key.is_empty() {
+                fields.insert(current_key.clone(), current_value.clone());
+            }
+            current_key = key.to_string();
+            current_value = value.trim_start().to_string();
+        }
+    }
+
+    // Flush the last field.
+    if !current_key.is_empty() {
+        fields.insert(current_key, current_value);
+    }
+
+    fields
+}
+
+// --- PACKAGES index parsing (for CRAN/Bioc) --------------------------------
+
+/// Parse the full PACKAGES file text into a list of package metadata.
 pub fn parse_packages(content: &str, source: PackageSource) -> Result<Vec<PackageMetadata>> {
     let mut packages = Vec::new();
 
-    // Split by blank lines to get individual package entries
-    // RUST CONCEPT: `split("\n\n")` returns an iterator over &str slices.
-    // No memory allocation — it just gives you views into the original string.
     for entry in content.split("\n\n") {
         let entry = entry.trim();
         if entry.is_empty() {
             continue;
         }
-
-        // RUST CONCEPT: `if let Some(pkg) = ...` is an "if-let" pattern.
-        // It tries to match the result. If it's Some(value), we use it.
-        // If it's None, we skip this entry.
         if let Some(pkg) = parse_single_entry(entry, &source) {
             packages.push(pkg);
         }
@@ -54,45 +83,14 @@ pub fn parse_packages(content: &str, source: PackageSource) -> Result<Vec<Packag
     Ok(packages)
 }
 
-/// Parse a single package entry from the PACKAGES file
-///
+/// Parse a single PACKAGES entry into a PackageMetadata.
 /// Returns None if the entry is malformed (we skip it silently).
 fn parse_single_entry(entry: &str, source: &PackageSource) -> Option<PackageMetadata> {
-    // RUST CONCEPT: HashMap for temporary key-value storage
-    // We parse each "Key: Value" line into a map, then extract what we need.
-    let mut fields = std::collections::HashMap::new();
+    let fields = parse_fields(entry);
 
-    let mut current_key = String::new();
-    let mut current_value = String::new();
-
-    for line in entry.lines() {
-        if line.starts_with(' ') || line.starts_with('\t') {
-            // Continuation line — append to current value
-            // (PACKAGES format uses indentation for multi-line values)
-            current_value.push(' ');
-            current_value.push_str(line.trim());
-        } else if let Some((key, value)) = line.split_once(": ") {
-            // New field — save the previous one
-            if !current_key.is_empty() {
-                fields.insert(current_key.clone(), current_value.clone());
-            }
-            current_key = key.to_string();
-            current_value = value.to_string();
-        }
-    }
-
-    // Don't forget the last field
-    if !current_key.is_empty() {
-        fields.insert(current_key, current_value);
-    }
-
-    // Extract the package name — if missing, skip this entry
-    // RUST CONCEPT: The `?` operator works inside functions that return Option too.
-    // But here we're being explicit with `match` for clarity.
     let name = fields.get("Package")?.clone();
     let version = fields.get("Version").cloned().unwrap_or_default();
 
-    // Parse dependency fields
     let depends = fields
         .get("Depends")
         .map(|d| parse_dependency_list(d))
@@ -105,19 +103,7 @@ fn parse_single_entry(entry: &str, source: &PackageSource) -> Option<PackageMeta
 
     let linking_to = fields
         .get("LinkingTo")
-        .map(|lt| {
-            lt.split(',')
-                .map(|s| {
-                    let trimmed = s.trim();
-                    // Strip version constraint: "BH (>= 1.64.0-1)" → "BH"
-                    match trimmed.find('(') {
-                        Some(pos) => trimmed[..pos].trim().to_string(),
-                        None => trimmed.to_string(),
-                    }
-                })
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
+        .map(|lt| parse_linking_to(lt))
         .unwrap_or_default();
 
     let needs_compilation = fields
@@ -139,23 +125,98 @@ fn parse_single_entry(entry: &str, source: &PackageSource) -> Option<PackageMeta
     })
 }
 
-/// Parse a comma-separated dependency list like:
+// --- DESCRIPTION parsing (for GitHub tarballs) -----------------------------
+
+/// Result of parsing a single DESCRIPTION file.
+///
+/// Shape mirrors PackageMetadata but without a `source` field — that's
+/// added by the caller, since DESCRIPTION files don't know where they
+/// came from. Adds `remotes`, which only appears in DESCRIPTION files.
+#[derive(Debug, Clone)]
+pub struct ParsedDescription {
+    pub name: String,
+    pub version: Option<String>,
+    pub depends: Vec<Dependency>,
+    pub imports: Vec<Dependency>,
+    pub linking_to: Vec<String>,
+    pub remotes: Vec<String>,
+    pub needs_compilation: bool,
+    pub system_requirements: Option<String>,
+}
+
+/// Parse a standalone DESCRIPTION file (the one inside a package tarball).
+///
+/// Unlike PACKAGES entries, a missing Package: field is a hard error —
+/// the file is malformed and we want to surface that.
+pub fn parse_description(text: &str) -> Result<ParsedDescription> {
+    let fields = parse_fields(text);
+
+    let name = fields
+        .get("Package")
+        .ok_or_else(|| anyhow!("DESCRIPTION has no Package: field"))?
+        .clone();
+
+    // Version is Option here — the caller decides whether to error.
+    // (For GitHub packages we error; for some future use we might not.)
+    let version = fields.get("Version").cloned();
+
+    let depends = fields
+        .get("Depends")
+        .map(|d| parse_dependency_list(d))
+        .unwrap_or_default();
+
+    let imports = fields
+        .get("Imports")
+        .map(|d| parse_dependency_list(d))
+        .unwrap_or_default();
+
+    let linking_to = fields
+        .get("LinkingTo")
+        .map(|lt| parse_linking_to(lt))
+        .unwrap_or_default();
+
+    // Remotes: comma-separated list of source specs. Format:
+    //   github::user/repo
+    //   github::user/repo@v1.0.0
+    //   github::user/repo/subdir@ref
+    //   cran::pkgname            (we ignore non-github prefixes for Phase 1)
+    let remotes = fields
+        .get("Remotes")
+        .map(|text| {
+            text.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let needs_compilation = fields
+        .get("NeedsCompilation")
+        .map(|v| v.trim() == "yes")
+        .unwrap_or(false);
+
+    let system_requirements = fields.get("SystemRequirements").cloned();
+
+    Ok(ParsedDescription {
+        name,
+        version,
+        depends,
+        imports,
+        linking_to,
+        remotes,
+        needs_compilation,
+        system_requirements,
+    })
+}
+
+// --- Shared field-value parsers --------------------------------------------
+
+/// Parse a comma-separated dependency list:
 ///   "R (>= 4.4.0), methods, BiocGenerics (>= 0.44.0)"
-/// into a Vec<Dependency>, filtering out "R" and base packages.
-///
-/// RUST CONCEPT: Iterator chains
-/// This is idiomatic Rust — transform data through a chain of operations.
-/// Each step is lazy (doesn't allocate) until .collect() materializes the result.
-///
-///   input.split(',')           // iterator over &str pieces
-///     .map(|s| s.trim())       // trim whitespace from each
-///     .filter(|s| !s.is_empty()) // remove empty entries
-///     .map(|s| parse_one(s))   // transform each into Dependency
-///     .collect()               // gather into Vec<Dependency>
+/// into a Vec<Dependency>, dropping base R packages.
 fn parse_dependency_list(input: &str) -> Vec<Dependency> {
-    // Base R packages that are always available — we skip these
     const BASE_PACKAGES: &[&str] = &[
-         "base", "compiler", "datasets", "grDevices", "graphics",
+        "base", "compiler", "datasets", "grDevices", "graphics",
         "grid", "methods", "parallel", "splines", "stats", "stats4",
         "tcltk", "tools", "utils",
     ];
@@ -165,10 +226,6 @@ fn parse_dependency_list(input: &str) -> Vec<Dependency> {
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .filter_map(|s| {
-            // RUST CONCEPT: filter_map combines filter + map.
-            // Return Some(value) to keep it, None to skip it.
-
-            // Parse "PackageName (>= 1.2.0)" or just "PackageName"
             let (name, version_req) = if let Some(paren_pos) = s.find('(') {
                 let name = s[..paren_pos].trim();
                 let version_part = s[paren_pos..].trim_matches(|c| c == '(' || c == ')');
@@ -177,7 +234,6 @@ fn parse_dependency_list(input: &str) -> Vec<Dependency> {
                 (s, None)
             };
 
-            // Skip base packages
             if BASE_PACKAGES.contains(&name) {
                 return None;
             }
@@ -190,12 +246,23 @@ fn parse_dependency_list(input: &str) -> Vec<Dependency> {
         .collect()
 }
 
-// --- Tests ---
-//
-// RUST CONCEPT: #[cfg(test)] module
-// Code inside #[cfg(test)] only compiles when running tests.
-// Run tests with: `cargo test`
-// This is like Python's unittest but built into the language.
+/// Parse a LinkingTo field — same structure as Depends/Imports but we
+/// only keep the names. Version constraints are stripped.
+fn parse_linking_to(input: &str) -> Vec<String> {
+    input
+        .split(',')
+        .map(|s| {
+            let trimmed = s.trim();
+            match trimmed.find('(') {
+                Some(pos) => trimmed[..pos].trim().to_string(),
+                None => trimmed.to_string(),
+            }
+        })
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+// --- Tests -----------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -206,7 +273,7 @@ mod tests {
         let input = "R (>= 4.4.0), methods, BiocGenerics (>= 0.44.0), ggplot2";
         let deps = parse_dependency_list(input);
 
-        // "R" and "methods" are base packages — should be filtered out
+        // R kept (not in BASE_PACKAGES). methods filtered out.
         assert_eq!(deps[0].name, "R");
         assert_eq!(deps[0].version_req, Some(">= 4.4.0".to_string()));
         assert_eq!(deps[1].name, "BiocGenerics");
@@ -233,5 +300,79 @@ SystemRequirements: C++17";
         assert!(pkg.needs_compilation);
         assert_eq!(pkg.imports.len(), 2);
         assert_eq!(pkg.linking_to, vec!["Rcpp", "RcppArmadillo"]);
+    }
+
+    #[test]
+    fn test_parse_description_basic() {
+        let text = "\
+Package: SeuratData
+Version: 0.2.2
+Depends: R (>= 3.5.0), Seurat (>= 3.0.0)
+Imports: methods, utils
+LinkingTo: Rcpp
+NeedsCompilation: no";
+
+        let parsed = parse_description(text).unwrap();
+        assert_eq!(parsed.name, "SeuratData");
+        assert_eq!(parsed.version, Some("0.2.2".to_string()));
+        assert_eq!(parsed.depends.len(), 2);  // R, Seurat
+        assert_eq!(parsed.imports.len(), 0);  // methods/utils filtered as base
+        assert_eq!(parsed.linking_to, vec!["Rcpp"]);
+        assert!(parsed.remotes.is_empty());
+        assert!(!parsed.needs_compilation);
+    }
+
+    #[test]
+    fn test_parse_description_with_remotes() {
+        let text = "\
+Package: MyPkg
+Version: 0.1.0
+Imports: SeuratData, dplyr
+Remotes: github::satijalab/seurat-data, github::user/other@v1.0.0";
+
+        let parsed = parse_description(text).unwrap();
+        assert_eq!(parsed.remotes.len(), 2);
+        assert_eq!(parsed.remotes[0], "github::satijalab/seurat-data");
+        assert_eq!(parsed.remotes[1], "github::user/other@v1.0.0");
+    }
+
+    #[test]
+    fn test_parse_description_missing_version() {
+        let text = "Package: MyPkg\nImports: dplyr";
+        let parsed = parse_description(text).unwrap();
+        assert_eq!(parsed.version, None);  // caller decides whether to error
+    }
+
+    #[test]
+    fn test_parse_description_missing_package_errors() {
+        let text = "Version: 1.0.0\nImports: dplyr";
+        assert!(parse_description(text).is_err());
+    }
+    #[test]
+    fn test_parse_description_multiline_imports() {
+        // seurat-data style: field name on one line, values indented below.
+        let text = "\
+Package: SeuratData
+Version: 0.2.2
+Depends:
+    R (>= 3.5.0)
+Imports:
+    cli,
+    crayon,
+    Matrix,
+    methods,
+    Seurat (>= 5.0.0)
+NeedsCompilation: no";
+
+        let parsed = parse_description(text).unwrap();
+        assert_eq!(parsed.name, "SeuratData");
+        assert_eq!(parsed.depends.len(), 1, "expected R in depends");
+        assert_eq!(parsed.depends[0].name, "R");
+
+        let import_names: Vec<&str> = parsed.imports.iter().map(|d| d.name.as_str()).collect();
+        // methods filtered as base; cli, crayon, Matrix, Seurat remain
+        assert!(import_names.contains(&"cli"), "got: {:?}", import_names);
+        assert!(import_names.contains(&"Seurat"), "got: {:?}", import_names);
+        assert_eq!(parsed.imports.len(), 4);
     }
 }

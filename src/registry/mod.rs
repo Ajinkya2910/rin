@@ -25,7 +25,7 @@
 // Don't worry — the compiler tells you exactly what's wrong. Just follow
 // the error messages and you'll learn fast.
 
-mod parser;
+pub(crate) mod parser;
 pub mod github;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
