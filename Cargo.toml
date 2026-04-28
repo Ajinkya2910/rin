@@ -56,7 +56,10 @@ indicatif = "0.17"                   # Progress bars
 # --- Compression ---
 # flate2: For decompressing PACKAGES.gz files from CRAN
 flate2 = "1"
-
+sha2 = "0.10"          # SHA-256 hashing for tarball integrity
+hex = "0.4"            # encode SHA-256 bytes as hex string
+tar = "0.4"            # iterate tarball entries
+urlencoding = "2"      # safe ref names in cache filenames (e.g. "feat/foo")
 # --- Parallel Processing ---
 # rayon: Data parallelism library. Makes parallel compilation trivial.
 # `items.par_iter().for_each(|item| compile(item))` — that's it.

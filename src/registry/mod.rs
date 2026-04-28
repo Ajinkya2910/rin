@@ -26,7 +26,7 @@
 // the error messages and you'll learn fast.
 
 mod parser;
-
+pub mod github;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
