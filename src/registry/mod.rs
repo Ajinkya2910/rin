@@ -145,6 +145,11 @@ pub struct Registry {
     /// but Archive versions can be added later.
     pub packages: HashMap<String, Vec<PackageMetadata>>,
 
+     /// GitHub-sourced packages, keyed by package name (from DESCRIPTION).
+    /// Single version each — GitHub packages are pinned to a commit SHA,
+    /// not version-resolved across multiple options like CRAN.
+    pub github_packages: HashMap<String, github::GitHubPackageMetadata>,
+
     /// R version detected on this system
     pub r_version: String,
 
@@ -222,18 +227,26 @@ impl Registry {
 
         Ok(Registry {
             packages,
+            github_packages: HashMap::new(),
             r_version,
             bioc_version,
         })
     }
 
     /// Look up a package by name — returns the latest/best version as a trait object.
+     /// Look up a package by name. GitHub packages take priority — if the
+    /// user explicitly added a GitHub package with a name that also exists
+    /// on CRAN/Bioc, the GitHub version shadows the registry version.
+    /// (Top-level shadowing only — see name-collision policy in the plan.)
     ///
     /// RUST CONCEPT: &dyn Trait
     /// Returns a reference to "something that implements PackageMeta" — could be
     /// a CRAN package, a Bioconductor package, or (later) a GitHub package.
     /// The resolver doesn't need to know which.
     pub fn get(&self, name: &str) -> Option<&dyn PackageMeta> {
+        if let Some(gh) = self.github_packages.get(name) {
+            return Some(gh as &dyn PackageMeta);
+        }
         self.packages
             .get(name)
             .and_then(|versions| versions.first())

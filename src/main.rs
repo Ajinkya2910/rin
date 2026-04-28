@@ -95,13 +95,15 @@ async fn main() -> Result<()> {
 async fn cmd_resolve(packages: &[String]) -> Result<()> {
     use colored::Colorize;
 
+   let parsed: Vec<source::PackageSource> = packages
+        .iter()
+        .map(|s| source::PackageSource::parse(s))
+        .collect::<Result<Vec<_>>>()?;
+
     println!("{}", "Resolving dependencies...".dimmed());
-
-    // Fetch package metadata from CRAN and Bioconductor
     let mut registry = registry::Registry::fetch().await?;
-
-    // Resolve the full dependency tree
-    let resolved = sat_resolver::resolve_with_constraints(&mut registry, packages).await?;
+    let root_names = sat_resolver::prepare_github_packages(&mut registry, &parsed).await?;
+    let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names).await?;
 
     // Display the tree
     println!(
@@ -116,6 +118,7 @@ async fn cmd_resolve(packages: &[String]) -> Result<()> {
         let source_label = match pkg.source.as_str() {
             "bioc" => "(bioc)".blue(),
             "cran" => "(cran)".dimmed(),
+            "github" => "(github)".magenta(),
             _ => "(unknown)".dimmed(),
         };
 
@@ -150,9 +153,15 @@ async fn cmd_resolve(packages: &[String]) -> Result<()> {
 async fn cmd_audit(packages: &[String]) -> Result<()> {
     use colored::Colorize;
 
+    let parsed: Vec<source::PackageSource> = packages
+        .iter()
+        .map(|s| source::PackageSource::parse(s))
+        .collect::<Result<Vec<_>>>()?;
+
     println!("{}", "Resolving dependencies...".dimmed());
     let mut registry = registry::Registry::fetch().await?;
-    let resolved = sat_resolver::resolve_with_constraints(&mut registry, packages).await?;
+    let root_names = sat_resolver::prepare_github_packages(&mut registry, &parsed).await?;
+    let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names).await?;
 
     println!("{}", "Checking system dependencies...".dimmed());
     let report = sysreq::audit(&resolved)?;
@@ -215,32 +224,27 @@ async fn cmd_install(packages: &[String], retry: bool) -> Result<()> {
     // Day 1: parse package specs (registry name vs. gh:user/repo). 
     // Resolver wiring comes later — for now we just verify the parser
     // and bail early if the user asked for a GitHub package.
-    if !retry {
-        let parsed: Vec<source::PackageSource> = packages
-            .iter()
-            .map(|s| source::PackageSource::parse(s))
-            .collect::<Result<Vec<_>>>()?;
-
-        for spec in &parsed {
-            println!("  parsed: {:?}", spec);
-        }
-
-        if parsed.iter().any(|p| matches!(p, source::PackageSource::GitHub(_))) {
-            anyhow::bail!(
-                "GitHub package support not yet implemented (Day 1: parser only)"
-            );
-        }
-    }
-
     if retry {
         println!("{}", "Retrying failed packages...".dimmed());
         installer::retry_install().await?;
         return Ok(());
     }
 
+    // Parse package specs — registry names pass through, GitHub specs
+    // get their metadata fetched and inserted into the registry below.
+    let parsed: Vec<source::PackageSource> = packages
+        .iter()
+        .map(|s| source::PackageSource::parse(s))
+        .collect::<Result<Vec<_>>>()?;
+
     println!("{}", "Resolving dependencies...".dimmed());
     let mut registry = registry::Registry::fetch().await?;
-    let resolved = sat_resolver::resolve_with_constraints(&mut registry, packages).await?;
+
+    // For each gh:... spec: fetch metadata and register in the GitHub bucket.
+    // Recursively follow `Remotes:` entries that point at other GitHub repos.
+    let root_names = sat_resolver::prepare_github_packages(&mut registry, &parsed).await?;
+
+    let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names).await?;
 
     // Pre-flight system dependency check
     println!("{}", "Pre-flight check: system dependencies...".dimmed());
@@ -305,9 +309,15 @@ async fn cmd_why(package: &str) -> Result<()> {
 async fn cmd_lock(packages: &[String]) -> Result<()> {
     use colored::Colorize;
 
+    let parsed: Vec<source::PackageSource> = packages
+        .iter()
+        .map(|s| source::PackageSource::parse(s))
+        .collect::<Result<Vec<_>>>()?;
+
     println!("{}", "Resolving dependencies...".dimmed());
     let mut registry = registry::Registry::fetch().await?;
-    let resolved = sat_resolver::resolve_with_constraints(&mut registry, packages).await?;
+    let root_names = sat_resolver::prepare_github_packages(&mut registry, &parsed).await?;
+    let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names).await?;
 
     let lockfile_path = lockfile::write(&resolved)?;
 

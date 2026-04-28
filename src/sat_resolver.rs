@@ -15,10 +15,118 @@
 use crate::registry::Registry;
 use crate::resolver::{ResolvedDeps, ResolvedPackage};
 use crate::version::{RVersion, VersionConstraint};
+use crate::source::PackageSource;
+use crate::registry::github;
+use std::path::PathBuf;
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 use colored::Colorize;
+
+/// Top-level entry point for installing a mix of registry + GitHub packages.
+///
+/// Walks the user-provided list, fetches metadata for any GitHub specs,
+/// recursively chases `Remotes:` entries, and registers everything in
+/// the registry's `github_packages` map. Returns the list of *names*
+/// the resolver should treat as roots (so registry names pass through
+/// unchanged, and GitHub specs become their package's `Package:` field).
+pub async fn prepare_github_packages(
+    registry: &mut crate::registry::Registry,
+    packages: &[PackageSource],
+) -> anyhow::Result<Vec<String>> {
+    let cache_dir = github_cache_dir()?;
+    let client = reqwest::Client::new();
+
+    let mut root_names = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+
+    for source in packages {
+        match source {
+            PackageSource::Registry(name) => {
+                root_names.push(name.clone());
+            }
+            PackageSource::GitHub(spec) => {
+                let meta = github::fetch_metadata(spec, &cache_dir, &client).await?;
+                let name = meta.name.clone();
+                println!(
+                    "  fetched gh:{}/{} as {} {}",
+                    spec.owner, spec.repo, meta.name, meta.version
+                );
+
+                // Recurse into Remotes: before inserting this package — order
+                // doesn't matter for correctness, but it keeps the diamond
+                // dedup test cleaner.
+                let remotes = meta.remotes.clone();
+                registry.github_packages.insert(name.clone(), meta);
+                root_names.push(name.clone());
+                seen.insert(format!("{}/{}", spec.owner, spec.repo));
+
+                process_remotes(registry, &remotes, &cache_dir, &client, &mut seen).await?;
+            }
+        }
+    }
+
+    Ok(root_names)
+}
+
+/// Recursively walk a list of `Remotes:` entries from a DESCRIPTION,
+/// fetching any GitHub-source ones and inserting them into the registry.
+///
+/// Non-GitHub Remotes (cran::, bioc::) are ignored — those packages
+/// will resolve through the normal registry path.
+///
+/// RUST CONCEPT: async recursion needs Box::pin
+/// Rust async functions return an anonymous Future type. Recursive async
+/// calls would create an infinitely-sized type (Future-of-Future-of-...),
+/// which the compiler can't lay out. Box::pin puts the future on the heap,
+/// giving it a fixed pointer-sized representation.
+fn process_remotes<'a>(
+    registry: &'a mut crate::registry::Registry,
+    remotes: &'a [String],
+    cache_dir: &'a std::path::Path,
+    client: &'a reqwest::Client,
+    seen: &'a mut HashSet<String>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
+    Box::pin(async move {
+        for remote_str in remotes {
+            let source = PackageSource::parse(remote_str)?;
+            let PackageSource::GitHub(spec) = source else {
+                // Non-github Remotes (cran::, bioc::) — let the normal
+                // registry path handle them.
+                continue;
+            };
+
+            let key = format!("{}/{}", spec.owner, spec.repo);
+            if !seen.insert(key) {
+                continue; // Diamond dedup: already fetched this repo.
+            }
+
+            let meta = github::fetch_metadata(&spec, cache_dir, client).await?;
+            println!(
+                "  fetched gh:{}/{} (via Remotes) as {} {}",
+                spec.owner, spec.repo, meta.name, meta.version
+            );
+
+            let next_remotes = meta.remotes.clone();
+            registry.github_packages.insert(meta.name.clone(), meta);
+
+            process_remotes(registry, &next_remotes, cache_dir, client, seen).await?;
+        }
+        Ok(())
+    })
+}
+
+/// Where we cache GitHub artifacts (refs and tarballs).
+/// Defaults to ~/.rv/cache; falls back to /tmp/rv-cache if home is unset.
+fn github_cache_dir() -> anyhow::Result<PathBuf> {
+    let base = match std::env::var("HOME") {
+        Ok(h) => PathBuf::from(h).join(".rv").join("cache"),
+        Err(_) => std::env::temp_dir().join("rv-cache"),
+    };
+    std::fs::create_dir_all(&base)?;
+    Ok(base)
+}
+
 
 /// A constraint on a package, tracked with who imposed it
 #[derive(Debug, Clone)]
