@@ -278,11 +278,21 @@ async fn cmd_install(packages: &[String], retry: bool) -> Result<()> {
             println!("  {} — needed by: {}", dep.name.red(), dep.needed_by.join(", "));
         }
 
-        // Ask user if we should install them
-        println!("\n{}", "Install them now? [Y/n]".bold());
-        // In a real implementation, read stdin here
-        // For now, we'll auto-install
+        use std::io::{self, Write};
+
+        print!("\n{} ", "Install them now? [Y/n]".bold());
+        io::stdout().flush()?;
+
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        let answer = answer.trim().to_lowercase();
+
+        if answer == "n" || answer == "no" {
+            anyhow::bail!("Aborted by user. Install system deps manually and re-run.");
+        }
+
         sysreq::install_missing(&report)?;
+
     }
 
     println!("\n{}", "Installing packages...".dimmed());

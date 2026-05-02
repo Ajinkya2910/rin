@@ -10,3 +10,4 @@ my-project/activate
 /target
 .rv-install-state.json
 my-project/
+rv.lock
