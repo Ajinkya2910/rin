@@ -301,20 +301,103 @@ async fn cmd_install(packages: &[String], retry: bool) -> Result<()> {
 async fn cmd_why(package: &str) -> Result<()> {
     use colored::Colorize;
 
-    let mut registry = registry::Registry::fetch().await?;
+    // Read the lockfile — the source of truth for what's resolved.
+    let lockfile = lockfile::read("rv.lock").context(
+        "rv why needs an rv.lock. Run `rv lock <packages>` first.",
+    )?;
 
-    // Find all paths from root packages to the target
-    let paths = resolver::find_dependency_paths(&registry, package)?;
+    // Index packages by name for fast lookup.
+    let by_name: std::collections::HashMap<&str, &lockfile::LockedPackage> = lockfile
+        .packages
+        .iter()
+        .map(|p| (p.name.as_str(), p))
+        .collect();
+
+    // Verify the target is actually in the tree.
+    if !by_name.contains_key(package) {
+        println!(
+            "{} is not in the current dependency tree.",
+            package.yellow()
+        );
+        return Ok(());
+    }
+
+    // Find every package that depends directly on `package`.
+    // For deeper paths, repeat upward until we hit a package nothing depends on.
+    let dependents_of = |target: &str| -> Vec<&str> {
+        lockfile
+            .packages
+            .iter()
+            .filter(|p| p.deps.iter().any(|d| d == target))
+            .map(|p| p.name.as_str())
+            .collect()
+    };
+
+    // Build all paths from a root (no dependents) down to the target.
+    fn build_paths<'a>(
+        target: &'a str,
+        by_name: &std::collections::HashMap<&str, &'a lockfile::LockedPackage>,
+        get_dependents: &impl Fn(&str) -> Vec<&'a str>,
+        seen: &mut std::collections::HashSet<&'a str>,
+    ) -> Vec<Vec<&'a str>> {
+        if !seen.insert(target) {
+            return vec![]; // cycle guard
+        }
+        let dependents = get_dependents(target);
+        if dependents.is_empty() {
+            seen.remove(target);
+            return vec![vec![target]]; // root
+        }
+        let mut all_paths = Vec::new();
+        for dep in dependents {
+            for mut sub in build_paths(dep, by_name, get_dependents, seen) {
+                sub.push(target);
+                all_paths.push(sub);
+            }
+        }
+        seen.remove(target);
+        all_paths
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    let paths = build_paths(package, &by_name, &dependents_of, &mut seen);
+
+    // Format a single package line: name version (source)
+    let format_pkg = |name: &str| -> String {
+        match by_name.get(name) {
+            Some(pkg) => {
+                let label = match pkg.source.as_str() {
+                    "github" => {
+                        let repo = pkg.repo.as_deref().unwrap_or("?");
+                        let short_sha = pkg
+                            .r#ref
+                            .as_deref()
+                            .map(|s| &s[..7.min(s.len())])
+                            .unwrap_or("?");
+                        format!("github: {}@{}", repo, short_sha).magenta().to_string()
+                    }
+                    "bioc" => "bioc".blue().to_string(),
+                    "cran" => "cran".dimmed().to_string(),
+                    other => other.dimmed().to_string(),
+                };
+                format!("{} {} ({})", name.bold(), pkg.version.dimmed(), label)
+            }
+            None => name.bold().to_string(),
+        }
+    };
+
+    println!("Why is {} needed:\n", package.bold());
 
     if paths.is_empty() {
-        println!("{} is not in the current dependency tree.", package.yellow());
+        // The target is itself a root — printed as a single line.
+        println!("{}", format_pkg(package));
+        println!("  {}", "(top-level dependency)".dimmed());
     } else {
-        println!("Why is {} needed:\n", package.bold());
         for path in &paths {
             for (i, step) in path.iter().enumerate() {
                 let indent = "  ".repeat(i);
                 let arrow = if i > 0 { "└── " } else { "" };
-                println!("{}{}{}", indent, arrow, step);
+                println!("{}{}{}", indent, arrow, format_pkg(step));
             }
             println!();
         }
