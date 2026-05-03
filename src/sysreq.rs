@@ -90,6 +90,16 @@ enum Probe {
     /// Use pkg-config to check for a development library, e.g. `libcurl`, `openssl`.
     /// Equivalent to: `pkg-config --exists <name>` returning 0.
     Pc(&'static str),
+    /// Search LD_LIBRARY_PATH for a library file matching this prefix.
+    /// e.g. `Ld("libhdf5")` matches `libhdf5.so`, `libhdf5.so.100`, etc.
+    /// Workhorse for HPC modules: they update LD_LIBRARY_PATH but typically
+    /// ship neither pkg-config files nor binaries on PATH.
+    Ld(&'static str),
+
+    /// Try multiple probes in order; succeeds if any one succeeds.
+    /// Use this when a library may be installed via different routes —
+    /// e.g. pkg-config on a normal Linux box, LD_LIBRARY_PATH on HPC.
+    Any(&'static [Probe]),
 }
 
 /// PRIMARY detection map: Debian canonical name → capability probe.
@@ -103,21 +113,49 @@ const CAPABILITY_MAP: &[(&str, Probe)] = &[
     ("cmake",           Probe::Bin("cmake")),
 
     // --- Libraries discoverable via pkg-config ---
-    ("libcurl4-openssl-dev", Probe::Pc("libcurl")),
-    ("libssl-dev",           Probe::Pc("openssl")),
-    ("libxml2-dev",          Probe::Pc("libxml-2.0")),
-    ("libhdf5-dev",          Probe::Pc("hdf5")),
-    ("libgsl-dev",           Probe::Pc("gsl")),
-    ("libgit2-dev",          Probe::Pc("libgit2")),
+    ("libcurl4-openssl-dev", Probe::Any(&[
+        Probe::Pc("libcurl"),
+        Probe::Ld("libcurl"),
+    ])),
+    ("libssl-dev",           Probe::Any(&[
+        Probe::Pc("openssl"),
+        Probe::Ld("libssl"),
+    ])),
+   ("libxml2-dev",          Probe::Any(&[
+        Probe::Pc("libxml-2.0"),
+        Probe::Ld("libxml2"),
+    ])),
+    ("libhdf5-dev",          Probe::Any(&[
+        Probe::Pc("hdf5"),
+        Probe::Ld("libhdf5"),
+    ])),
+   ("libgsl-dev",           Probe::Any(&[
+        Probe::Pc("gsl"),
+        Probe::Ld("libgsl"),
+    ])),
+    ("libgit2-dev",          Probe::Any(&[
+        Probe::Pc("libgit2"),
+        Probe::Ld("libgit2"),
+    ])),
     ("libsodium-dev",        Probe::Pc("libsodium")),
     ("libfontconfig1-dev",   Probe::Pc("fontconfig")),
     ("libharfbuzz-dev",      Probe::Pc("harfbuzz")),
     ("libfribidi-dev",       Probe::Pc("fribidi")),
-    ("libfreetype6-dev",     Probe::Pc("freetype2")),
-    ("libpng-dev",           Probe::Pc("libpng")),
+    ("libfreetype6-dev",     Probe::Any(&[
+        Probe::Pc("freetype2"),
+        Probe::Ld("libfreetype"),
+    ])),
+    ("libpng-dev",           Probe::Any(&[
+        Probe::Pc("libpng"),
+        Probe::Ld("libpng"),
+    ])),
     ("libtiff5-dev",         Probe::Pc("libtiff-4")),
     ("libcairo2-dev",        Probe::Pc("cairo")),
-    ("libpq-dev",            Probe::Pc("libpq")),
+    ("libpq-dev",            Probe::Any(&[
+        Probe::Pc("libpq"),
+        Probe::Ld("libpq"),
+    ])),
+
     ("libproj-dev",          Probe::Pc("proj")),
     ("libavfilter-dev",      Probe::Pc("libavfilter")),
 
@@ -147,12 +185,12 @@ const RPM_MAP: &[(&str, &str)] = &[
     ("libfontconfig1-dev",   "fontconfig-devel"),
     ("libharfbuzz-dev",      "harfbuzz-devel"),
     ("libfribidi-dev",       "fribidi-devel"),
-    ("libfreetype6-dev",     "freetype-devel"),
+     ("libfreetype6-dev",     "freetype-devel"),
     ("libpng-dev",           "libpng-devel"),
     ("libtiff5-dev",         "libtiff-devel"),
     ("libcairo2-dev",        "cairo-devel"),
     ("libmagick++-dev",      "ImageMagick-c++-devel"),
-    ("libpq-dev",            "libpq-devel"),
+   ("libpq-dev",            "libpq-devel"),
     ("libmariadb-dev",       "mariadb-devel"),
     ("libgdal-dev",          "gdal-devel"),
     ("libgeos-dev",          "geos-devel"),
@@ -263,6 +301,32 @@ fn has_pkgconfig(name: &str) -> bool {
         .map(|s| s.success())
         .unwrap_or(false)
 }
+/// Does any directory in LD_LIBRARY_PATH contain a library file
+/// starting with this prefix?
+fn has_ld_library(prefix: &str) -> bool {
+    let paths = match std::env::var("LD_LIBRARY_PATH") {
+        Ok(p) => p,
+        Err(_) => return false,
+    };
+
+    for dir in paths.split(':').filter(|s| !s.is_empty()) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            // Match libfoo.so, libfoo.so.1, libfoo.so.1.2.3, libfoo.dylib.
+            if name_str.starts_with(prefix)
+                && (name_str.contains(".so") || name_str.ends_with(".dylib"))
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
 
 /// Get the version string from pkg-config (best-effort).
 fn pkgconfig_version(name: &str) -> String {
@@ -284,14 +348,17 @@ fn pkgconfig_version(name: &str) -> String {
 /// Returns `Some(version)` if the library is usable on this system,
 /// regardless of how it was installed.
 fn check_capability(lib_name: &str) -> Option<String> {
-    // RUST CONCEPT: The `?` operator on Option
-    // `find(...)` returns Option<&(K, V)>. `.map(...)` transforms the inner.
-    // `?` unwraps the Some or early-returns None — like Python's walrus-with-guard.
     let probe = CAPABILITY_MAP
         .iter()
         .find(|(n, _)| *n == lib_name)
         .map(|(_, p)| p)?;
 
+    run_probe(probe)
+}
+
+/// Recursive probe runner — separates dispatch from lookup so `Any`
+/// can call back into itself without re-resolving CAPABILITY_MAP.
+fn run_probe(probe: &Probe) -> Option<String> {
     match probe {
         Probe::Bin(name) => {
             if has_binary(name) {
@@ -307,6 +374,14 @@ fn check_capability(lib_name: &str) -> Option<String> {
                 None
             }
         }
+        Probe::Ld(prefix) => {
+            if has_ld_library(prefix) {
+                Some("detected (LD_LIBRARY_PATH)".to_string())
+            } else {
+                None
+            }
+        }
+        Probe::Any(probes) => probes.iter().find_map(run_probe),
     }
 }
 

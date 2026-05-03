@@ -272,7 +272,8 @@ fn install_single_package(pkg: &ResolvedPackage, bioc_version: &str) -> Result<(
         }
     }
 
-    run_r_cmd_install(&tarball_path)
+    run_r_cmd_install(&tarball_path, &pkg.name)?;
+    Ok(())
 }
 
 /// Install a GitHub-sourced package from its already-downloaded tarball.
@@ -320,7 +321,7 @@ fn install_from_github_tarball(
         gh.subdir.as_deref(),
     )?;
 
-    match run_r_cmd_install(&pkg_dir) {
+    match run_r_cmd_install(&pkg_dir, &pkg.name) {
         Ok(()) => {
             let _ = std::fs::remove_dir_all(&tmp_extract);
             Ok(())
@@ -356,7 +357,7 @@ fn github_cache_dir() -> Result<PathBuf> {
 }
 /// Run `R CMD INSTALL` against a tarball OR an extracted package directory.
 /// R CMD INSTALL accepts both — that's why this helper works for both paths.
-fn run_r_cmd_install(target: &PathBuf) -> Result<()> {
+fn run_r_cmd_install(target: &PathBuf, pkg_name: &str) -> Result<()> {
     let lib_arg = get_venv_lib().map(|p| format!("--library={}", p.display()));
 
     let mut cmd = Command::new("R");
@@ -370,8 +371,21 @@ fn run_r_cmd_install(target: &PathBuf) -> Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+
+        // Persist the full stderr for debugging — friendly_error below
+        // is a one-line summary; users need the real output too.
+        let log_path = std::path::PathBuf::from(format!(
+            "/tmp/rv-fail-{}.log",
+            pkg_name
+        ));
+        let _ = std::fs::write(&log_path, stderr.as_bytes());
+
         let friendly_error = parse_compile_error(&stderr);
-        anyhow::bail!("{}", friendly_error);
+        anyhow::bail!(
+            "{}\n  Full output: {}",
+            friendly_error,
+            log_path.display()
+        );
     }
 
     Ok(())
@@ -397,9 +411,16 @@ fn parse_compile_error(stderr: &str) -> String {
     }
 
     // C++ standard mismatch
-    if stderr.contains("std::filesystem") || stderr.contains("is not available in C++") {
-        return "C++ standard mismatch: package needs C++17 but R is configured for an older standard.\n  \
-                Fix: echo 'CXX_STD = CXX17' >> ~/.R/Makevars".to_string();
+     if stderr.contains("std::filesystem")
+        || stderr.contains("is not available in C++")
+        || stderr.contains("is a C++14 extension")
+        || stderr.contains("is a C++17 extension")
+        || stderr.contains("is a C++20 extension")
+        || stderr.contains("requires '-std=c++")
+    {
+        return "C++ standard mismatch: package needs a newer C++ standard than R is using.\n  \
+                Fix: echo 'CXX_STD = CXX17' >> ~/.R/Makevars\n  \
+                Then: rv install --retry".to_string();
     }
 
     // Missing Fortran compiler
