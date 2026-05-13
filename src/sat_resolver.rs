@@ -259,6 +259,7 @@ pub async fn resolve_with_constraints(
             let conflicts2 = validate_constraints(registry, &constraints2);
 
             if conflicts2.is_empty() {
+                verify_all_deps_resolved(&resolved2)?;
                 let duration = start.elapsed();
                 return Ok(ResolvedDeps {
                     packages: resolved2,
@@ -313,6 +314,7 @@ pub async fn resolve_with_constraints(
         anyhow::bail!("{}", msg);
     }
 
+    verify_all_deps_resolved(&resolved)?;
     let duration = start.elapsed();
     Ok(ResolvedDeps {
         packages: resolved,
@@ -402,6 +404,17 @@ fn collect_with_constraints(
     for dep_name in &dep_names {
         if registry.get(dep_name).is_some() {
             collect_with_constraints(registry, dep_name, visited, resolved, constraints)?;
+        } else {
+            anyhow::bail!(
+                "Transitive dependency '{dep}' (needed by '{parent}') was not found \
+                 in CRAN, Bioconductor, or any registered GitHub source.\n  \
+                 If '{dep}' is a GitHub-only package, declare it in {parent}'s \
+                 DESCRIPTION via `Remotes: github::owner/{dep}`.\n  \
+                 If it's a Bioconductor data/experiment package, that repo is not \
+                 yet fetched by rv.",
+                dep = dep_name,
+                parent = pkg_name
+            );
         }
     }
 
@@ -517,6 +530,29 @@ fn validate_constraints(
     }
 
     conflicts
+}
+/// Post-resolution sanity check (Bug #22 safety net).
+/// Walks every resolved package's dependencies list and confirms every name
+/// also appears in `resolved`. If anything is missing here, the resolver
+/// itself has a bug — surface it loudly rather than producing a half-broken
+/// install plan.
+fn verify_all_deps_resolved(resolved: &[ResolvedPackage]) -> Result<()> {
+    let resolved_names: HashSet<&str> =
+        resolved.iter().map(|p| p.name.as_str()).collect();
+
+    for pkg in resolved {
+        for dep in &pkg.dependencies {
+            if !resolved_names.contains(dep.as_str()) {
+                anyhow::bail!(
+                    "Resolver invariant violated: '{}' lists '{}' as a dependency \
+                     but '{}' was not resolved. This is an rv bug — please report \
+                     with the package spec you used.",
+                    pkg.name, dep, dep
+                );
+            }
+        }
+    }
+    Ok(())
 }
 #[cfg(test)]
 mod tests {

@@ -24,6 +24,10 @@ use std::process::Command;
 pub struct SysreqReport {
     pub found: Vec<InstalledDep>,
     pub missing: Vec<MissingDep>,
+    /// Compiled R packages with no RSPM entry AND no SYSREQ_MAP entry.
+    /// Surfaced to the user with a "consider --skip-sysreq" hint (Bug #2 UX).
+    pub uncertain: Vec<String>,
+
 }
 
 #[derive(Debug)]
@@ -280,6 +284,63 @@ fn linux_family() -> LinuxFamily {
 fn is_macos() -> bool {
     std::env::consts::OS == "macos"
 }
+/// Detect HPC environment via module-system env vars (Bug #1).
+/// Lmod sets LMOD_CMD; classic modules set MODULESHOME; both set MODULEPATH.
+/// On HPC, sudo apt/dnf will fail — we adapt prompts and skip RSPM calls
+/// (no outbound network on compute nodes is common).
+pub fn is_hpc_environment() -> bool {
+    std::env::var("LMOD_CMD").is_ok()
+        || std::env::var("MODULESHOME").is_ok()
+        || std::env::var("MODULEPATH").is_ok()
+}
+
+/// Parsed /etc/os-release values normalized to RSPM-canonical names.
+struct OsRelease {
+    distribution: String, // "ubuntu", "debian", "rockylinux", "redhat", "centos", "opensuse"
+    release: String,      // "22.04" or "9" depending on distro convention
+}
+
+/// Read /etc/os-release and return RSPM-canonical (distribution, release).
+/// Returns None on macOS or unparseable systems.
+fn os_release_info() -> Option<OsRelease> {
+    if is_macos() {
+        return None;
+    }
+    let content = std::fs::read_to_string("/etc/os-release").ok()?;
+
+    let mut id = String::new();
+    let mut version_id = String::new();
+    for line in content.lines() {
+        if let Some(v) = line.strip_prefix("ID=") {
+            id = v.trim_matches('"').to_lowercase();
+        } else if let Some(v) = line.strip_prefix("VERSION_ID=") {
+            version_id = v.trim_matches('"').to_string();
+        }
+    }
+    if id.is_empty() || version_id.is_empty() {
+        return None;
+    }
+
+    // RSPM names: rocky/alma → rockylinux, RHEL → redhat, Oracle → oraclelinux.
+    let distribution = match id.as_str() {
+        "rocky" | "almalinux" => "rockylinux".to_string(),
+        "rhel" => "redhat".to_string(),
+        "ol" => "oraclelinux".to_string(),
+        _ => id,
+    };
+
+    // RHEL-family: RSPM wants just the major version ("9.4" → "9").
+    let release = match distribution.as_str() {
+        "rockylinux" | "redhat" | "centos" | "oraclelinux" => version_id
+            .split('.')
+            .next()
+            .unwrap_or(&version_id)
+            .to_string(),
+        _ => version_id,
+    };
+
+    Some(OsRelease { distribution, release })
+}
 
 // ---------------------------------------------------------------------------
 // Capability probes
@@ -507,22 +568,54 @@ fn check_installed(package_name: &str) -> Option<String> {
 // Public API
 // ---------------------------------------------------------------------------
 
-pub fn audit(resolved: &ResolvedDeps) -> Result<SysreqReport> {
+pub async fn audit(resolved: &ResolvedDeps) -> Result<SysreqReport> {
+    // Routing context.
+    let on_macos = is_macos();
+    let on_hpc = is_hpc_environment();
+    let os_info = os_release_info();
+
+    // Skip RSPM if macOS, HPC (likely no network), or no OS detected.
+    let use_rspm = !on_macos && !on_hpc && os_info.is_some();
+    let mut rspm_cache = if use_rspm {
+        let o = os_info.as_ref().unwrap();
+        rspm::load(&o.distribution, &o.release)
+    } else {
+        rspm::Cache::default()
+    };
+    let client = if use_rspm { Some(reqwest::Client::new()) } else { None };
+
     let mut required_syslibs: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
+    let mut uncertain: Vec<String> = Vec::new();
+    let mut cache_dirty = false;
 
     for pkg in &resolved.packages {
-        for (r_pkg, sys_libs) in SYSREQ_MAP {
-            if pkg.name == *r_pkg {
-                for lib in *sys_libs {
-                    required_syslibs
-                        .entry(lib.to_string())
-                        .or_default()
-                        .push(pkg.name.clone());
+        let libs = lookup_sysreqs_for_pkg(
+            pkg,
+            &os_info,
+            use_rspm,
+            &mut rspm_cache,
+            &mut cache_dirty,
+            client.as_ref(),
+        )
+        .await;
+
+        match libs {
+            Some(libs) => {
+                for lib in libs {
+                    required_syslibs.entry(lib).or_default().push(pkg.name.clone());
+                }
+            }
+            None => {
+                // Pure-R packages with no entry almost certainly need nothing.
+                // Only mark compiled packages with no mapping as uncertain.
+                if pkg.needs_compilation && !is_in_sysreq_map(&pkg.name) {
+                    uncertain.push(pkg.name.clone());
                 }
             }
         }
 
+        // Compilation tooling (unchanged from before).
         if pkg.needs_compilation {
             required_syslibs
                 .entry("build-essential".to_string())
@@ -533,7 +626,6 @@ pub fn audit(resolved: &ResolvedDeps) -> Result<SysreqReport> {
                 .dependencies
                 .iter()
                 .any(|d| ["Matrix", "survival", "minqa"].contains(&d.as_str()));
-
             if needs_fortran {
                 required_syslibs
                     .entry("gfortran".to_string())
@@ -543,15 +635,19 @@ pub fn audit(resolved: &ResolvedDeps) -> Result<SysreqReport> {
         }
     }
 
+    // Persist cache only if RSPM gave us new info.
+    if cache_dirty {
+        if let Some(o) = &os_info {
+            let _ = rspm::save(&o.distribution, &o.release, &rspm_cache);
+        }
+    }
+
+    // Capability probes (unchanged) — these are the authoritative "is it usable?" check.
     let mut found = Vec::new();
     let mut missing = Vec::new();
-
     for (lib_name, needed_by) in &required_syslibs {
         if let Some(version) = check_installed(lib_name) {
-            found.push(InstalledDep {
-                name: lib_name.clone(),
-                version,
-            });
+            found.push(InstalledDep { name: lib_name.clone(), version });
         } else {
             missing.push(MissingDep {
                 name: lib_name.clone(),
@@ -560,7 +656,48 @@ pub fn audit(resolved: &ResolvedDeps) -> Result<SysreqReport> {
         }
     }
 
-    Ok(SysreqReport { found, missing })
+    Ok(SysreqReport { found, missing, uncertain })
+}
+
+/// Per-package router. Returns Some(libs) on a definitive answer (may be empty),
+/// None when neither RSPM nor SYSREQ_MAP can tell us anything.
+async fn lookup_sysreqs_for_pkg(
+    pkg: &crate::resolver::ResolvedPackage,
+    os_info: &Option<OsRelease>,
+    use_rspm: bool,
+    rspm_cache: &mut rspm::Cache,
+    cache_dirty: &mut bool,
+    client: Option<&reqwest::Client>,
+) -> Option<Vec<String>> {
+    // RSPM is CRAN-only. Bioc / GitHub / macOS / HPC skip straight to SYSREQ_MAP.
+    let rspm_eligible = use_rspm && pkg.source == "cran" && client.is_some();
+
+    if rspm_eligible {
+        let os = os_info.as_ref().unwrap();
+        if let Some(libs) = rspm_cache.entries.get(&pkg.name) {
+            return Some(libs.clone()); // cache hit
+        }
+        if let Some(libs) =
+            rspm::query(client.unwrap(), &pkg.name, &os.distribution, &os.release).await
+        {
+            rspm_cache.entries.insert(pkg.name.clone(), libs.clone());
+            *cache_dirty = true;
+            return Some(libs);
+        }
+        // RSPM miss → fall through to SYSREQ_MAP.
+    }
+
+    // SYSREQ_MAP — for Bioc, GitHub, macOS, HPC, or RSPM fallback.
+    for (r_pkg, sys_libs) in SYSREQ_MAP {
+        if pkg.name == *r_pkg {
+            return Some(sys_libs.iter().map(|s| s.to_string()).collect());
+        }
+    }
+    None
+}
+
+fn is_in_sysreq_map(name: &str) -> bool {
+    SYSREQ_MAP.iter().any(|(n, _)| *n == name)
 }
 
 pub fn get_brew_name(linux_name: &str) -> String {
@@ -758,4 +895,107 @@ pub fn fix_makevars(fix: &MakevarsFix) -> Result<()> {
     }
 
     Ok(())
+}
+// ---------------------------------------------------------------------------
+// RSPM sysreqs lookup (Bug #3)
+//
+// Layered design:
+//   1. On-disk cache  (~/.cache/rv/sysreqs/{distro}-{release}.json) — survives runs
+//   2. RSPM HTTP API  (3s timeout; cache write on success)
+//   3. SYSREQ_MAP     (fallback; also the only source for Bioc/GitHub/macOS)
+//
+// We skip RSPM entirely on HPC (often no outbound network) and on macOS
+// (RSPM returns Linux names). Capability probes downstream are unchanged.
+// ---------------------------------------------------------------------------
+
+mod rspm {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::time::Duration;
+    use serde::{Deserialize, Serialize};
+
+    const RSPM_BASE: &str = "https://packagemanager.posit.co/__api__/repos/cran";
+    const TIMEOUT_SECS: u64 = 3;
+
+    /// Persistent cache keyed by R-package name. Empty Vec = "RSPM says no sysreqs".
+    /// Key absent = "never queried" (caller falls back to SYSREQ_MAP).
+    #[derive(Serialize, Deserialize, Default)]
+    pub struct Cache {
+        pub entries: HashMap<String, Vec<String>>,
+    }
+
+    fn cache_path(distro: &str, release: &str) -> Option<PathBuf> {
+        let home = std::env::var("HOME").ok()?;
+        Some(PathBuf::from(home)
+            .join(".cache/rv/sysreqs")
+            .join(format!("{}-{}.json", distro, release)))
+    }
+
+    pub fn load(distro: &str, release: &str) -> Cache {
+        cache_path(distro, release)
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(distro: &str, release: &str, cache: &Cache) -> anyhow::Result<()> {
+        let path = cache_path(distro, release)
+            .ok_or_else(|| anyhow::anyhow!("HOME unset; cannot write sysreq cache"))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, serde_json::to_string_pretty(cache)?)?;
+        Ok(())
+    }
+
+    /// Query RSPM for one R package. Returns Some(libs) on a definitive
+    /// answer (possibly empty list); None on miss/error so caller can
+    /// fall through to SYSREQ_MAP.
+    ///
+    /// Uses .text() + manual serde_json parse to avoid needing reqwest's
+    /// "json" feature in Cargo.toml.
+    pub async fn query(
+        client: &reqwest::Client,
+        pkg: &str,
+        distro: &str,
+        release: &str,
+    ) -> Option<Vec<String>> {
+        let url = format!(
+            "{base}/sysreqs?all=false&pkgname={pkg}&distribution={distro}&release={release}",
+            base = RSPM_BASE,
+            pkg = pkg,
+            distro = distro,
+            release = release,
+        );
+
+        let resp = client
+            .get(&url)
+            .timeout(Duration::from_secs(TIMEOUT_SECS))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+
+        let text = resp.text().await.ok()?;
+        let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+
+        // Shape: { "requirements": [ { "requirements": { "packages": [...] }, ... }, ... ] }
+        let reqs = json.get("requirements")?.as_array()?;
+        let mut libs: Vec<String> = Vec::new();
+        for r in reqs {
+            if let Some(pkgs) = r.pointer("/requirements/packages").and_then(|p| p.as_array()) {
+                for p in pkgs {
+                    if let Some(s) = p.as_str() {
+                        let s = s.to_string();
+                        if !libs.contains(&s) {
+                            libs.push(s);
+                        }
+                    }
+                }
+            }
+        }
+        Some(libs)
+    }
 }

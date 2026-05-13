@@ -66,6 +66,16 @@ pub enum Commands {
         /// Resume a previously failed installation
         #[arg(long, default_value_t = false)]
         retry: bool,
+        /// Skip the system-requirements pre-flight entirely.
+        /// Use when rv's sysreq map is wrong, or you've installed deps in a
+        /// non-standard path rv can't probe (HPC modules, conda envs, etc.).
+        #[arg(long, default_value_t = false)]
+        skip_sysreq: bool,
+        /// Ignore a specific missing system library (repeatable).
+        /// Use for fine-grained overrides instead of skipping all checks.
+        /// Example: rv install gert --ignore-missing libgit2-dev
+        #[arg(long, value_name = "LIB")]
+        ignore_missing: Vec<String>,
     },
 
     /// Explain why a package is in the dependency tree

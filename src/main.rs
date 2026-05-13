@@ -51,9 +51,8 @@ async fn main() -> Result<()> {
             // `rv audit DESeq2`
             cmd_audit(&packages).await?;
         }
-        cli::Commands::Install { packages, retry } => {
-            // `rv install DESeq2` or `rv install --retry`
-            cmd_install(&packages, retry).await?;
+        cli::Commands::Install { packages, retry, skip_sysreq, ignore_missing } => {
+            cmd_install(&packages, retry, skip_sysreq, ignore_missing).await?;
         }
         cli::Commands::Why { package } => {
             // `rv why rlang`
@@ -164,7 +163,7 @@ async fn cmd_audit(packages: &[String]) -> Result<()> {
     let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names).await?;
 
     println!("{}", "Checking system dependencies...".dimmed());
-    let report = sysreq::audit(&resolved)?;
+    let report = sysreq::audit(&resolved).await?;
     
     // Display results
     for dep in &report.found {
@@ -180,22 +179,28 @@ async fn cmd_audit(packages: &[String]) -> Result<()> {
     }
     
     if !report.missing.is_empty() {
-   if std::env::consts::OS == "macos" {
-        println!("\n{}\n  brew install {}", "Fix with:".bold(),
-            report.missing.iter()
-                .map(|d| sysreq::get_brew_name(&d.name))
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
-    } else {
-        println!("\n{}\n  sudo apt install {}", "Fix with:".bold(),
-            report.missing.iter()
-                .map(|d| d.name.as_str())
-                .collect::<Vec<_>>()
-                .join(" ")
-        );
+        if sysreq::is_hpc_environment() {
+            println!("\n{} HPC environment — resolve via the module system:", "Fix with:".bold());
+            for dep in &report.missing {
+                println!("  module spider {}", dep.name);
+            }
+            println!("  module load <name>/<version>   # for each lib above");
+        } else if std::env::consts::OS == "macos" {
+            println!("\n{}\n  brew install {}", "Fix with:".bold(),
+                report.missing.iter()
+                    .map(|d| sysreq::get_brew_name(&d.name))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        } else {
+            println!("\n{}\n  sudo apt install {}", "Fix with:".bold(),
+                report.missing.iter()
+                    .map(|d| d.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            );
+        }
     }
-}
 // Offer to fix Makevars if needed
     if let Some(fix) = sysreq::check_makevars() {
         println!(
@@ -218,7 +223,8 @@ async fn cmd_audit(packages: &[String]) -> Result<()> {
 }
 
 /// Install packages
-async fn cmd_install(packages: &[String], retry: bool) -> Result<()> {
+async fn cmd_install(packages: &[String], retry: bool,skip_sysreq: bool,
+    ignore_missing: Vec<String>,) -> Result<()> {
     use colored::Colorize;
 
     // Day 1: parse package specs (registry name vs. gh:user/repo). 
@@ -265,33 +271,60 @@ async fn cmd_install(packages: &[String], retry: bool) -> Result<()> {
     let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names).await?;
 
     // Pre-flight system dependency check
-    println!("{}", "Pre-flight check: system dependencies...".dimmed());
-    let report = sysreq::audit(&resolved)?;
-
-    if !report.missing.is_empty() {
+    // ── Pre-flight system dependency check (Bugs #1, #2) ───────────────
+    if skip_sysreq {
         println!(
-            "\n{} Missing {} system libraries:",
-            "✗".red(),
-            report.missing.len()
+            "{} skipping system-requirements check (--skip-sysreq).",
+            "⚠".yellow()
         );
-        for dep in &report.missing {
-            println!("  {} — needed by: {}", dep.name.red(), dep.needed_by.join(", "));
+    } else {
+        println!("{}", "Pre-flight check: system dependencies...".dimmed());
+        let mut report = sysreq::audit(&resolved).await?;
+
+        // #2: surgical override — drop user-named libs from the missing list.
+        if !ignore_missing.is_empty() {
+            let ignored: Vec<String> = report
+                .missing
+                .iter()
+                .filter(|d| ignore_missing.contains(&d.name))
+                .map(|d| d.name.clone())
+                .collect();
+            report.missing.retain(|d| !ignore_missing.contains(&d.name));
+            for name in &ignored {
+                println!("  {} {} (--ignore-missing)", "↷".dimmed(), name.dimmed());
+            }
         }
 
-        use std::io::{self, Write};
-
-        print!("\n{} ", "Install them now? [Y/n]".bold());
-        io::stdout().flush()?;
-
-        let mut answer = String::new();
-        io::stdin().read_line(&mut answer)?;
-        let answer = answer.trim().to_lowercase();
-
-        if answer == "n" || answer == "no" {
-            anyhow::bail!("Aborted by user. Install system deps manually and re-run.");
+        if !report.missing.is_empty() {
+            println!(
+                "\n{} Missing {} system librar{}:",
+                "✗".red(),
+                report.missing.len(),
+                if report.missing.len() == 1 { "y" } else { "ies" }
+            );
+            for dep in &report.missing {
+                println!(
+                    "  {} — needed by: {}",
+                    dep.name.red(),
+                    dep.needed_by.join(", ")
+                );
+            }
+            handle_missing_sysreqs(&report, &packages.join(" "))?;
         }
-
-        sysreq::install_missing(&report)?;
+        if !report.uncertain.is_empty() {
+            println!(
+                "\n{} Could not verify sysreqs for {} compiled package{}: {}",
+                "ℹ".blue(),
+                report.uncertain.len(),
+                if report.uncertain.len() == 1 { "" } else { "s" },
+                report.uncertain.join(", ").dimmed()
+            );
+            println!(
+                "  rv has no mapping for these; if their deps are present \
+                 (e.g. via module/conda), re-run with {} to silence this.",
+                "--skip-sysreq".bold()
+            );
+        }
 
     }
 
@@ -751,6 +784,87 @@ fn cmd_venv_remove(path: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Decide what to do about missing system libraries — environment-aware.
+///
+/// HPC (Lmod/Modules detected): no sudo available. Show `module spider`
+/// guidance and prompt [s/N] — skip-and-trust-modules, or abort.
+///
+/// Non-HPC: prompt [Y/n/s] — install via apt/brew, abort, or skip-and-continue.
+///
+/// In both branches, surface --skip-sysreq / --ignore-missing at the moment
+/// they become useful (Bug #2's UX requirement: don't make users dig in --help).
+fn handle_missing_sysreqs(
+    report: &sysreq::SysreqReport,
+    install_cmd_tail: &str,
+) -> Result<()> {
+    use colored::Colorize;
+    use std::io::{self, Write};
+
+    if sysreq::is_hpc_environment() {
+        println!(
+            "\n{} HPC environment detected (Lmod/Modules).",
+            "ℹ".blue()
+        );
+        println!("  rv can't install system libraries on a cluster (no sudo).");
+        println!("  Resolve through the module system:");
+        for dep in &report.missing {
+            println!("    module spider {}", dep.name);
+        }
+        println!("    module load <name>/<version>   # for each lib above\n");
+
+        print!(
+            "{} [s/N] {} ",
+            "Already loaded the right modules? Skip the check?".bold(),
+            "(default: abort)".dimmed()
+        );
+        io::stdout().flush()?;
+
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        match answer.trim().to_lowercase().as_str() {
+            "s" | "skip" => {
+                println!(
+                    "{} trusting loaded modules.\n  \
+                     Tip: pass {} next time: rv install {} --skip-sysreq",
+                    "⚠".yellow(),
+                    "--skip-sysreq".bold(),
+                    install_cmd_tail
+                );
+                Ok(())
+            }
+            _ => anyhow::bail!(
+                "Aborted: load the required modules and re-run, or pass --skip-sysreq."
+            ),
+        }
+    } else {
+        print!(
+            "\n{} [Y/n/s] {} ",
+            "Install missing libraries now?".bold(),
+            "(s = skip and continue without them)".dimmed()
+        );
+        io::stdout().flush()?;
+
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        match answer.trim().to_lowercase().as_str() {
+            "n" | "no" => anyhow::bail!(
+                "Aborted by user. Install system deps manually and re-run."
+            ),
+            "s" | "skip" => {
+                println!(
+                    "{} proceeding without installing system libs.\n  \
+                     Tip: pass {} next time, or {} to skip a single lib.",
+                    "⚠".yellow(),
+                    "--skip-sysreq".bold(),
+                    "--ignore-missing <LIB>".bold()
+                );
+                Ok(())
+            }
+            _ => sysreq::install_missing(report),
+        }
+    }
 }
 
 

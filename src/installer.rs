@@ -133,9 +133,12 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> 
                 }
                 Err(e) => {
                     let err_msg = e.to_string();
-                    if err_msg.contains("lazy loading failed") && !retry_queue.contains(&name) {
-                        // First failure with lazy loading — retry in next tier
-                        println!("  {} {} — will retry next tier (lazy loading race)", "↻".yellow(), name.yellow());
+                    // Bug #6: only retry on a probe-confirmed race. The [LAZY_RACE]
+                    // marker is set by parse_compile_error after loadNamespace
+                    // succeeded standalone. A bare "lazy loading failed" without
+                    // that marker is a real error and should fail through.
+                    if err_msg.contains("[LAZY_RACE]") && !retry_queue.contains(&name) {
+                        println!("  {} {} — will retry next tier (probe-confirmed race)", "↻".yellow(), name.yellow());
                         retry_queue.insert(name);
                     } else {
                         // Permanent failure (either not lazy loading, or already retried once)
@@ -380,7 +383,7 @@ fn run_r_cmd_install(target: &PathBuf, pkg_name: &str) -> Result<()> {
         ));
         let _ = std::fs::write(&log_path, stderr.as_bytes());
 
-        let friendly_error = parse_compile_error(&stderr);
+        let friendly_error = parse_compile_error(&stderr, pkg_name);
         anyhow::bail!(
             "{}\n  Full output: {}",
             friendly_error,
@@ -390,10 +393,46 @@ fn run_r_cmd_install(target: &PathBuf, pkg_name: &str) -> Result<()> {
 
     Ok(())
 }
+
+/// Result of probing whether a package's namespace actually loads.
+enum ProbeResult {
+    Loaded,
+    Failed(String),
+    ProbeError(String),
+}
+
+/// Run `loadNamespace(pkg)` in a fresh R process to find the real cause
+/// of a lazy-loading failure (Bug #19). R's bare "lazy loading failed"
+/// hides ABI mismatches, missing deps, missing symbols — this surfaces them.
+fn probe_namespace_load(pkg_name: &str) -> ProbeResult {
+    if pkg_name == "unknown" || pkg_name.is_empty() {
+        return ProbeResult::ProbeError("no package name to probe".to_string());
+    }
+
+    let r_code = if let Some(venv_path) = get_venv_lib() {
+        format!(
+            "tryCatch(loadNamespace('{pkg}', lib.loc='{lib}'), \
+             error = function(e) {{ message(conditionMessage(e)); quit(status=1) }})",
+            pkg = pkg_name, lib = venv_path.display()
+        )
+    } else {
+        format!(
+            "tryCatch(loadNamespace('{pkg}'), \
+             error = function(e) {{ message(conditionMessage(e)); quit(status=1) }})",
+            pkg = pkg_name
+        )
+    };
+
+    match Command::new("R").args(["--vanilla", "--slave", "-e", &r_code]).output() {
+        Ok(out) if out.status.success() => ProbeResult::Loaded,
+        Ok(out) => ProbeResult::Failed(String::from_utf8_lossy(&out.stderr).into_owned()),
+        Err(e) => ProbeResult::ProbeError(e.to_string()),
+    }
+}
 /// Parse a compilation error and return a human-friendly message
 ///
 /// Instead of dumping 200 lines of g++ output, we extract the actual problem.
-fn parse_compile_error(stderr: &str) -> String {
+fn parse_compile_error(stderr: &str, pkg_name: &str) -> String {
     // Check for common error patterns
 
     // Missing header file
@@ -451,15 +490,45 @@ fn parse_compile_error(stderr: &str) -> String {
 
     // Lazy loading failure (parallel compilation race condition)
     // e.g., "ERROR: lazy loading failed for package 'ggrepel'"
+    // Lazy loading failure — probe for the real cause (Bugs #19, #6).
     if stderr.contains("lazy loading failed") {
-        let pkg_name = stderr.lines()
+        let extracted = stderr
+            .lines()
             .find(|l| l.contains("lazy loading failed"))
-            .and_then(|l| l.split('\'').nth(1))
-            .unwrap_or("unknown");
-        return format!(
-            "Lazy loading failed for '{}' — a dependency likely hasn't finished registering.\n  This is a timing issue, not a real error. Re-run rv install to retry.",
-            pkg_name
-        );
+            .and_then(|l| l.split('\'').nth(1));
+
+        // Bug #6: if we couldn't extract a name from the message, fall back
+        // to the package being installed. If that's also unhelpful, the
+        // probe will return ProbeError and we won't misclassify as a race.
+        let probe_target = match extracted {
+            Some(n) if !n.is_empty() => n,
+            _ => pkg_name,
+        };
+
+        match probe_namespace_load(probe_target) {
+            ProbeResult::Loaded => {
+                // Genuine race — namespace loads cleanly in a fresh process.
+                // Marker is consumed by the orchestrator's retry logic.
+                return format!(
+                    "[LAZY_RACE] Lazy loading failed for '{}'; namespace loads cleanly standalone — parallel-install race. Retrying.",
+                    probe_target
+                );
+            }
+            ProbeResult::Failed(real_err) => {
+                let trimmed = real_err.trim();
+                return format!(
+                    "Lazy loading failed for '{}'. Real cause:\n  {}",
+                    probe_target,
+                    if trimmed.is_empty() { "<probe produced no error output>" } else { trimmed }
+                );
+            }
+            ProbeResult::ProbeError(e) => {
+                return format!(
+                    "Lazy loading failed for '{}' (probe failed: {}). See full log.",
+                    probe_target, e
+                );
+            }
+        }
     }
 
     // Permission denied
@@ -561,23 +630,77 @@ pub fn check_installed_versions(packages: &[ResolvedPackage]) -> Vec<String> {
 }
 
 /// Resume a previously failed installation
+/// Resume a previously failed installation.
+///
+/// Strategy: reconstruct the resolved tree from rv.lock, then hand it to
+/// `install()`. The installer's existing `check_installed_versions()` skip
+/// logic handles "already done" packages automatically — so the retry
+/// naturally targets failed + unattempted packages without custom filtering.
+///
+/// State file is optional (used for messaging). Lockfile is required —
+/// without it we'd have to re-resolve, which defeats the point of retry.
 pub async fn retry_install() -> Result<()> {
     use colored::Colorize;
 
-    let state = load_install_state()?;
+    // State file is informational only — installer rebuilds it on success.
+    let state = load_install_state().ok();
 
-    println!(
-        "{} {} packages already installed, retrying remaining...",
-        "✓".green(),
-        state.installed.len()
-    );
+    let lockfile = crate::lockfile::read("rv.lock").context(
+        "retry needs rv.lock. Run `rv install <packages>` to generate one first.",
+    )?;
 
-    // Re-resolve and install only what's missing
-    // TODO: In a full implementation, re-read the lockfile and
-    // install only packages not in state.installed
+    // Convert locked entries back into ResolvedPackages. Mirrors the same
+    // logic in cmd_restore (main.rs), minus the integrity check — retry is
+    // resuming the SAME session, so tarballs are already verified-by-download.
+    let resolved = ResolvedDeps {
+        packages: lockfile
+            .packages
+            .iter()
+            .map(|pkg| {
+                let github_source = if pkg.source == "github" {
+                    let repo = pkg.repo.as_ref().unwrap();
+                    let (owner, repo_name) = repo.split_once('/').unwrap();
+                    Some(crate::resolver::GitHubSource {
+                        owner: owner.to_string(),
+                        repo: repo_name.to_string(),
+                        commit_sha: pkg.r#ref.clone().unwrap(),
+                        subdir: pkg.subdir.clone(),
+                        tarball_sha256: pkg.tarball_sha256.clone().unwrap(),
+                    })
+                } else {
+                    None
+                };
 
-    println!("{}", "Retry not fully implemented yet — re-run rv install".yellow());
+                ResolvedPackage {
+                    name: pkg.name.clone(),
+                    version: pkg.version.clone(),
+                    source: pkg.source.clone(),
+                    needs_compilation: false,
+                    dependencies: pkg.deps.clone(),
+                    sha256: pkg.sha256.clone(),
+                    github_source,
+                }
+            })
+            .collect(),
+        duration_secs: 0.0,
+    };
 
+    match &state {
+        Some(s) => println!(
+            "{} {} already installed, {} failed previously — re-attempting failures and unattempted packages.",
+            "↻".blue(),
+            s.installed.len(),
+            s.failed.len(),
+        ),
+        None => println!(
+            "{} no prior state — attempting full lockfile.",
+            "↻".blue()
+        ),
+    }
+
+    install(&resolved, &lockfile.metadata.bioc_version).await?;
+
+    println!("\n{} Retry complete.", "✓".green());
     Ok(())
 }
 
