@@ -76,6 +76,14 @@ pub enum Commands {
         /// Example: rv install gert --ignore-missing libgit2-dev
         #[arg(long, value_name = "LIB")]
         ignore_missing: Vec<String>,
+        /// Strict pre-flight: block install when sysreqs appear missing.
+        /// Default is advisory — rv lists potentially-missing libs and
+        /// proceeds, letting the compiler surface real blockers. Use this
+        /// flag to opt back into the old "prompt + abort before install"
+        /// behavior (useful for CI, automated builds).
+        #[arg(long, default_value_t = false)]
+        strict_sysreq: bool,
+
     },
 
     /// Explain why a package is in the dependency tree

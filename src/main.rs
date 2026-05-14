@@ -51,8 +51,8 @@ async fn main() -> Result<()> {
             // `rv audit DESeq2`
             cmd_audit(&packages).await?;
         }
-        cli::Commands::Install { packages, retry, skip_sysreq, ignore_missing } => {
-            cmd_install(&packages, retry, skip_sysreq, ignore_missing).await?;
+        cli::Commands::Install { packages, retry, skip_sysreq, ignore_missing, strict_sysreq } => {
+            cmd_install(&packages, retry, skip_sysreq, ignore_missing, strict_sysreq).await?;
         }
         cli::Commands::Why { package } => {
             // `rv why rlang`
@@ -223,8 +223,13 @@ async fn cmd_audit(packages: &[String]) -> Result<()> {
 }
 
 /// Install packages
-async fn cmd_install(packages: &[String], retry: bool,skip_sysreq: bool,
-    ignore_missing: Vec<String>,) -> Result<()> {
+async fn cmd_install(
+    packages: &[String],
+    retry: bool,
+    skip_sysreq: bool,
+    ignore_missing: Vec<String>,
+    strict_sysreq: bool,
+) -> Result<()> {
     use colored::Colorize;
 
     // Day 1: parse package specs (registry name vs. gh:user/repo). 
@@ -308,20 +313,72 @@ async fn cmd_install(packages: &[String], retry: bool,skip_sysreq: bool,
         }
 
         if !report.missing.is_empty() {
-            println!(
-                "\n{} Missing {} system librar{}:",
-                "✗".red(),
-                report.missing.len(),
-                if report.missing.len() == 1 { "y" } else { "ies" }
-            );
-            for dep in &report.missing {
+            if strict_sysreq {
+                // --strict-sysreq: original gatekeeping behavior (pre-#41).
+                // Useful for CI / automated builds that want to fail fast.
                 println!(
-                    "  {} — needed by: {}",
-                    dep.name.red(),
-                    dep.needed_by.join(", ")
+                    "\n{} Missing {} system librar{}:",
+                    "✗".red(),
+                    report.missing.len(),
+                    if report.missing.len() == 1 { "y" } else { "ies" }
+                );
+                for dep in &report.missing {
+                    println!(
+                        "  {} — needed by: {}",
+                        dep.name.red(),
+                        dep.needed_by.join(", ")
+                    );
+                }
+                handle_missing_sysreqs(&report, &packages.join(" "))?;
+            } else {
+                // Bug #41 default: advisory pre-flight, not gatekeeping.
+                //
+                // The compiler is the source of truth — if a package builds,
+                // the sysreq was satisfied (regardless of how rv detected it).
+                // RSPM frequently over-reports (pandoc as a runtime-only dep,
+                // libX11 for optional clipboard features, etc.); rv shouldn't
+                // second-guess the compiler with false-positive blocks.
+                //
+                // Real blockers will surface as compile errors with actionable
+                // messages; user fixes those (module load / conda / Makevars)
+                // and `rv install --retry` resumes from where it stopped.
+                println!(
+                    "\n{} {} potentially missing system librar{} (advisory):",
+                    "ℹ".blue(),
+                    report.missing.len(),
+                    if report.missing.len() == 1 { "y" } else { "ies" }
+                );
+                for dep in &report.missing {
+                    println!(
+                        "  {} — needed by: {}",
+                        dep.name.dimmed(),
+                        dep.needed_by.join(", ").dimmed()
+                    );
+                }
+
+                if sysreq::is_hpc_environment() {
+                    println!(
+                        "\n  {} If a build fails on these, load via the module system:",
+                        "→".dimmed()
+                    );
+                    for dep in &report.missing {
+                        println!("    module spider {}", sysreq::module_hint(&dep.name));
+                    }
+                }
+
+                println!(
+                    "\n  {} Proceeding — compile errors will surface real blockers.",
+                    "→".dimmed()
+                );
+                println!(
+                    "    {} blocks install on any flagged sysreq (CI-friendly).",
+                    "--strict-sysreq".bold()
+                );
+                println!(
+                    "    {} silences this advisory entirely.\n",
+                    "--skip-sysreq".bold()
                 );
             }
-            handle_missing_sysreqs(&report, &packages.join(" "))?;
         }
         if !report.uncertain.is_empty() {
             println!(
