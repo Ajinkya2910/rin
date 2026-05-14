@@ -376,8 +376,10 @@ fn os_release_info() -> Option<OsRelease> {
     }
 
     // RSPM names: rocky/alma → rockylinux, RHEL → redhat, Oracle → oraclelinux.
+    // RSPM canonical names : RSPM rejects "rockylinux" and "rhel" with HTTP 400.
+    // "centos" works for Rocky/Alma (binary-compatible); "redhat" is the canonical RHEL name.
     let distribution = match id.as_str() {
-        "rocky" | "almalinux" => "rockylinux".to_string(),
+        "rocky" | "almalinux" | "centos" => "centos".to_string(),
         "rhel" => "redhat".to_string(),
         "ol" => "oraclelinux".to_string(),
         _ => id,
