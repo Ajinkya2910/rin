@@ -334,6 +334,15 @@ fn linux_family() -> LinuxFamily {
         LinuxFamily::Unknown
     }
 }
+/// Is Homebrew available? Used by the install path to decide whether
+/// to offer auto-install of macOS sysreqs.
+pub fn has_brew() -> bool {
+    Command::new("brew")
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
 
 fn is_macos() -> bool {
     std::env::consts::OS == "macos"
@@ -346,6 +355,34 @@ pub fn is_hpc_environment() -> bool {
     std::env::var("LMOD_CMD").is_ok()
         || std::env::var("MODULESHOME").is_ok()
         || std::env::var("MODULEPATH").is_ok()
+}
+/// Detect installed gcc version. Returns (major, full_version_string).
+/// Bug #14: gcc 15+ is too strict for many R packages (esp. older Bioc).
+pub fn detect_gcc_version() -> Option<(u32, String)> {
+    let output = Command::new("gcc").arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first_line = stdout.lines().next()?.to_string();
+
+    // Bug #14 fix: only flag GNU gcc. Apple clang reports as "gcc" on macOS
+    // but has different rules and shouldn't trigger the gcc-15-too-strict warning.
+    if first_line.to_lowercase().contains("clang") {
+        return None;
+    }
+
+    for token in first_line.split_whitespace() {
+        let cleaned = token.trim_matches(|c: char| !c.is_ascii_digit() && c != '.');
+        if let Some(major_str) = cleaned.split('.').next() {
+            if let Ok(major) = major_str.parse::<u32>() {
+                if major >= 4 && major <= 99 {
+                    return Some((major, first_line));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Parsed /etc/os-release values normalized to RSPM-canonical names.
@@ -884,7 +921,23 @@ pub fn check_makevars() -> Option<MakevarsFix> {
         .split_whitespace()
         .filter(|s| s.starts_with("-L"))
         .map(|s| s.trim_start_matches("-L").to_string())
-        .filter(|path| !std::path::Path::new(path).exists())
+         .filter(|path| {
+            // Bug #56: a path is "bad" if either:
+            //   (a) the directory doesn't exist, OR
+            //   (b) the directory exists but contains no libgfortran*
+            //       (empty stubs left behind by old R installers).
+            let p = std::path::Path::new(path);
+            if !p.exists() {
+                return true;
+            }
+            // Directory exists — check whether libgfortran* actually lives there.
+            match std::fs::read_dir(p) {
+                Ok(entries) => !entries
+                    .flatten()
+                    .any(|e| e.file_name().to_string_lossy().starts_with("libgfortran")),
+                Err(_) => true, // can't read it — treat as bad
+            }
+        })
         .collect();
 
     if bad_paths.is_empty() {

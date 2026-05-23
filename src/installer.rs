@@ -37,6 +37,30 @@ const STATE_FILE: &str = ".rv-install-state.json";
 pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> {
     use colored::Colorize;
 
+    // Bug #46: ensure we have a writable install target before doing anything.
+    // On HPC, R's default library is often the shared module install (read-only).
+    // If so, auto-create .rv/lib so the install lands somewhere the user owns.
+    let auto_created = ensure_writable_library()?;
+    if auto_created {
+        println!(
+            "  {} System R library is read-only — created {} for this project.",
+            "ℹ".blue(),
+            ".rv/lib".bold()
+        );
+        println!(
+            "    {} for a fully-configured environment with an activate script.",
+            "Run `rv venv` instead".dimmed()
+        );
+    }
+
+    // Bug #16: one-time advisory so users see why their conda libs are visible.
+    if let Some((pkgconfig_dir, _)) = conda_env_additions() {
+        println!(
+            "  {} conda env detected: prepending {} to PKG_CONFIG_PATH",
+            "ℹ".blue(),
+            pkgconfig_dir.dimmed()
+        );
+    }
     let total = resolved.packages.len();
     let mut installed: HashSet<String> = HashSet::new();
     let mut failed: Vec<(String, String)> = Vec::new(); // (name, error)
@@ -370,6 +394,31 @@ fn run_r_cmd_install(target: &PathBuf, pkg_name: &str) -> Result<()> {
     }
     cmd.arg(target);
 
+    // Bug #16: propagate conda env libs into the build subprocess.
+    // Prepend so user-set values still win for collisions.
+    if let Some((pkgconfig_dir, lib_dir)) = conda_env_additions() {
+        let existing_pc = std::env::var("PKG_CONFIG_PATH").unwrap_or_default();
+        let new_pc = if existing_pc.is_empty() {
+            pkgconfig_dir
+        } else {
+            format!("{}:{}", pkgconfig_dir, existing_pc)
+        };
+        cmd.env("PKG_CONFIG_PATH", new_pc);
+
+        #[cfg(target_os = "macos")]
+        let ld_var = "DYLD_LIBRARY_PATH";
+        #[cfg(not(target_os = "macos"))]
+        let ld_var = "LD_LIBRARY_PATH";
+
+        let existing_ld = std::env::var(ld_var).unwrap_or_default();
+        let new_ld = if existing_ld.is_empty() {
+            lib_dir
+        } else {
+            format!("{}:{}", lib_dir, existing_ld)
+        };
+        cmd.env(ld_var, new_ld);
+    }
+
     let output = cmd.output().context("R is not installed")?;
 
     if !output.status.success() {
@@ -582,6 +631,81 @@ fn get_venv_lib() -> Option<std::path::PathBuf> {
         return Some(std::fs::canonicalize(&local).unwrap_or(local));
     }
     None
+}
+
+/// Bug #46: ensure rv has a writable library before any install starts.
+///
+/// Decision tree:
+///   1. A venv is already active (RV_VENV set, or .rv/lib exists in CWD)
+///      → use it, no change. (get_venv_lib already handles this.)
+///   2. R's default library is writable
+///      → use it (preserves normal Linux/Mac dev experience).
+///   3. R's default library is read-only (typical HPC: shared module install)
+///      → auto-create .rv/lib in the current directory. get_venv_lib() will
+///        pick this up on every subsequent call, so the rest of the install
+///        pipeline needs no changes.
+///
+/// Returns true if auto-creation happened — the caller prints a one-time notice.
+fn ensure_writable_library() -> Result<bool> {
+    use std::io::Write;
+
+    // Case 1: venv already active. Nothing to do.
+    if get_venv_lib().is_some() {
+        return Ok(false);
+    }
+
+    // Ask R for its default library path.
+    let r_default: Option<PathBuf> = Command::new("R")
+        .args(["--vanilla", "--slave", "-e", "cat(.libPaths()[1])"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+
+    // Case 2: test if R's default is writable by opening a probe file.
+    // This is more portable than checking Unix permissions and handles
+    // edge cases like read-only mounts and quota-exhausted directories.
+    if let Some(ref default_lib) = r_default {
+        let probe = default_lib.join(".rv-write-test");
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&probe)
+        {
+            let _ = f.write_all(b"ok");
+            let _ = std::fs::remove_file(&probe);
+            return Ok(false); // System library is writable — use it.
+        }
+    }
+
+    // Case 3: system library is read-only (or R is unavailable).
+    // Auto-create .rv/lib. get_venv_lib() will see it on the next call.
+    let auto_lib = PathBuf::from(".rv/lib");
+    std::fs::create_dir_all(&auto_lib)
+        .context("Failed to create .rv/lib for fallback install location")?;
+
+    Ok(true)
+}
+
+/// If a conda env is active, return (pkgconfig_dir, lib_dir) to prepend
+/// to PKG_CONFIG_PATH and LD_LIBRARY_PATH (DYLD_LIBRARY_PATH on macOS).
+/// Returns None if CONDA_PREFIX is unset or doesn't look like a real env.
+fn conda_env_additions() -> Option<(String, String)> {
+    let prefix = std::env::var("CONDA_PREFIX").ok()?;
+    let prefix_path = std::path::PathBuf::from(&prefix);
+
+    // Sanity: stale CONDA_PREFIX pointing at a deleted env is common.
+    if !prefix_path.join("lib").is_dir() {
+        return None;
+    }
+
+    Some((
+        prefix_path.join("lib").join("pkgconfig").display().to_string(),
+        prefix_path.join("lib").display().to_string(),
+    ))
 }
 /// Return the set of all package names currently installed in the
 /// active R library (venv if active, system library otherwise).

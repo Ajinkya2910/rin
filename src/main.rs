@@ -240,6 +240,59 @@ async fn cmd_install(
         installer::retry_install().await?;
         return Ok(());
     }
+    // Bug #50: auto-apply Makevars fix in install path (not just audit).
+    // The fix exists in sysreq::check_makevars() but was only wired into
+    // `rv audit`. Users mostly skip audit and go straight to install, so
+    // the Fortran-path mismatch bit them on install with a confusing error.
+    // Run the same auto-fix at install start so RcppArmadillo / Matrix /
+    // RcppEigen / fracdiff / SparseM / minqa work first try on macOS.
+    if let Some(fix) = sysreq::check_makevars() {
+        println!(
+            "{} R's Fortran paths are misconfigured:",
+            "⚠".yellow()
+        );
+        println!("  R looks in:      {}", fix.bad_paths.join(", "));
+        println!("  gfortran is at:  {}", fix.correct_lib);
+        println!(
+            "  {} writing fix to {}",
+            "→".blue(),
+            fix.makevars_path.display()
+        );
+        sysreq::fix_makevars(&fix)?;
+        println!("  {} Makevars updated.\n", "✓".green());
+    }
+    // Bug #14: warn when gcc is too new for older R packages.
+    if let Some((major, _)) = sysreq::detect_gcc_version() {
+        if major >= 15 {
+            println!(
+                "{} gcc {} detected. Many R packages (esp. older Bioconductor)",
+                "⚠".yellow(),
+                major
+            );
+            println!("  have known compatibility issues with gcc 15+ (stricter template rules).");
+            if sysreq::is_hpc_environment() {
+                println!("  Recommended: {}", "module load gcc/12".bold());
+                println!("    {}", "module spider gcc   # see versions available".dimmed());
+            } else if std::env::consts::OS == "macos" {
+                println!("  Recommended: use Apple's clang (default) or {}", "brew install gcc@12".bold());
+            } else {
+                println!("  Recommended: use the distro's gcc-12 / gcc-13 package.");
+            }
+            println!("  If you hit confusing template errors, swap compilers and `rv install --retry`.\n");
+        }
+    }
+
+    // Bug #55: on macOS without Homebrew, point users at the install command once.
+    if std::env::consts::OS == "macos" && !sysreq::has_brew() {
+        println!(
+            "{} Homebrew not detected. To enable rv's auto-install of system libraries:",
+            "ℹ".blue()
+        );
+        println!(
+            r#"  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)""#
+        );
+        println!("  Then `rv install --retry`.\n");
+    }
 
     // Parse package specs — registry names pass through, GitHub specs
     // get their metadata fetched and inserted into the registry below.
@@ -286,6 +339,12 @@ async fn cmd_install(
         lockfile_path.display(),
         resolved.packages.len()
     );
+    // Bug #44 + #49: warn about HDF5/MPI module misconfigurations before
+    // the user wastes time waiting for hdf5r to fail.
+    let pkg_names: Vec<String> = resolved.packages.iter().map(|p| p.name.clone()).collect();
+    if let Some(warning) = sysreq::detect_hdf5_problem(&pkg_names) {
+        println!("\n{} {}\n", "⚠".yellow(), warning);
+    }
 
     // Pre-flight system dependency check
     // ── Pre-flight system dependency check (Bugs #1, #2) ───────────────
@@ -363,6 +422,43 @@ async fn cmd_install(
                     );
                     for dep in &report.missing {
                         println!("    module spider {}", sysreq::module_hint(&dep.name));
+                    }
+                }
+
+                // Bug #53: on macOS with brew, offer auto-install of advisory libs.
+                // Safe here — homebrew is user-scoped, no sudo. Default to yes:
+                // the user is mid-install and probably wants their packages to build.
+                // Bug #53 + #53b: offer auto-install of advisory libs.
+                // macOS uses brew (no sudo). Linux non-HPC uses apt/dnf (may sudo-prompt).
+                // HPC skipped — no sudo on clusters, module hints already shown above.
+                let can_auto_install = match std::env::consts::OS {
+                    "macos" => sysreq::has_brew(),
+                    _ => !sysreq::is_hpc_environment(),
+                };
+
+                if can_auto_install {
+                    use std::io::{self, Write};
+                    let prompt = if std::env::consts::OS == "macos" {
+                        "brew install these now? [Y/n] "
+                    } else {
+                        "install these now (may prompt for sudo password)? [Y/n] "
+                    };
+                    print!("\n  {} {}", "?".blue(), prompt);
+                    io::stdout().flush()?;
+
+                    let mut answer = String::new();
+                    io::stdin().read_line(&mut answer)?;
+                    let answer = answer.trim().to_lowercase();
+
+                    if answer.is_empty() || answer == "y" || answer == "yes" {
+                        match sysreq::install_missing(&report) {
+                            Ok(()) => println!("  {} install completed.", "✓".green()),
+                            Err(e) => println!(
+                                "  {} install failed: {}\n    Continuing — compile errors will surface real blockers.",
+                                "⚠".yellow(),
+                                e
+                            ),
+                        }
                     }
                 }
 
