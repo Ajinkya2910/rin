@@ -11,3 +11,5 @@ my-project/activate
 .rv-install-state.json
 my-project/
 rv.lock
+.rv-install-state.json
+.rv-pbtest/
