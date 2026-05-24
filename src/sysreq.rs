@@ -356,6 +356,48 @@ pub fn is_hpc_environment() -> bool {
         || std::env::var("MODULESHOME").is_ok()
         || std::env::var("MODULEPATH").is_ok()
 }
+/// Bug #44 + #49: detect HDF5 module problems before they cause hdf5r failures.
+///
+/// Common HPC scenarios:
+///   - Module loads an MPI-only HDF5 build (h5pcc present, h5cc missing)
+///     → hdf5r's configure script needs h5cc/h5pcc; if only h5pcc is there
+///        but MPI itself isn't loaded, the build dies on `mpi.h`.
+///   - No HDF5 module loaded at all: silent until install fails.
+///
+/// Returns a warning string if there's a problem, None otherwise.
+/// Only fires when an HDF5-needing package is being installed.
+pub fn detect_hdf5_problem(package_names: &[String]) -> Option<String> {
+    let hdf5_packages = ["hdf5r", "rhdf5", "HDF5Array", "Rhtslib", "Rsamtools"];
+    let needs_hdf5 = package_names
+        .iter()
+        .any(|p| hdf5_packages.contains(&p.as_str()));
+    if !needs_hdf5 {
+        return None;
+    }
+
+    let has_h5cc = has_binary("h5cc");
+    let has_h5pcc = has_binary("h5pcc");
+    let has_mpicc = has_binary("mpicc") || has_binary("mpicxx");
+
+    // Serial HDF5 available — all good.
+    if has_h5cc {
+        return None;
+    }
+
+    // MPI HDF5 loaded but no MPI compiler — will fail on mpi.h.
+    if has_h5pcc && !has_mpicc {
+        return Some(
+            "MPI HDF5 loaded (h5pcc only, no h5cc) AND no MPI compiler detected.\n  \
+             hdf5r/rhdf5 needs either:\n    \
+               (a) a serial HDF5 module — try: module spider hdf5\n    \
+               (b) MPI loaded alongside — try: module load mpich (or openmpi/mvapich)\n  \
+             Alternative: conda install -c conda-forge hdf5".to_string()
+        );
+    }
+
+    // No HDF5 binaries at all — install will fail with a clear error anyway.
+    None
+}
 /// Detect installed gcc version. Returns (major, full_version_string).
 /// Bug #14: gcc 15+ is too strict for many R packages (esp. older Bioc).
 pub fn detect_gcc_version() -> Option<(u32, String)> {
