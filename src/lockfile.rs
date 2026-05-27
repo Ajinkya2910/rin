@@ -47,6 +47,12 @@ pub struct LockfileMetadata {
 
     /// When the lockfile was generated (ISO 8601)
     pub generated_at: String,
+
+    /// User-specified install targets (the "roots" the resolver started from).
+    /// Empty on lockfiles written before this field existed; treat as
+    /// "all packages are roots" for backward compat at read time.
+    #[serde(default)]
+    pub roots: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -92,14 +98,14 @@ pub struct LockedPackage {
 ///   - PathBuf : Path :: String : &str
 ///
 /// We return PathBuf because we're creating a new path.
-pub fn write(resolved: &ResolvedDeps) -> Result<PathBuf> {
-    // Build the lockfile structure
+pub fn write(resolved: &ResolvedDeps, roots: &[String]) -> Result<PathBuf> {
     let lockfile = Lockfile {
         metadata: LockfileMetadata {
             rv_version: env!("CARGO_PKG_VERSION").to_string(),
-            r_version: "4.4.0".to_string(), // TODO: get from registry
-            bioc_version: "3.19".to_string(), // TODO: get from registry
+            r_version: "4.4.0".to_string(),
+            bioc_version: "3.19".to_string(),
             generated_at: chrono_now(),
+            roots: roots.to_vec(),
         },
         packages: resolved
             .packages
@@ -211,6 +217,7 @@ mod tests {
                     dependencies: vec![],
                     sha256: None,
                     github_source: None,
+                     system_requirements: None,
                 },
                 ResolvedPackage {
                     name: "S4Vectors".to_string(),
@@ -220,13 +227,14 @@ mod tests {
                     dependencies: vec!["BiocGenerics".to_string()],
                     sha256: None,
                     github_source: None,
+                     system_requirements: None,
                 },
             ],
             duration_secs: 0.1,
         };
 
         // Write lockfile
-        let path = write(&resolved).unwrap();
+        let path = write(&resolved,&[]).unwrap();
 
         // Read it back
         let lockfile = read(&path).unwrap();

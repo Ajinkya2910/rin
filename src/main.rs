@@ -326,13 +326,44 @@ async fn cmd_install(
     // Recursively follow `Remotes:` entries that point at other GitHub repos.
     let root_names = sat_resolver::prepare_github_packages(&mut registry, &parsed).await?;
 
+    // Merge incremental installs into existing rv.lock instead of clobbering.
+let mut all_roots: Vec<String> = packages.to_vec();
+if let Ok(existing) = lockfile::read("rv.lock") {
+    let prior_roots: Vec<String> = if existing.metadata.roots.is_empty() {
+        // Old-format lockfile — fall back to using all packages as roots
+        // so we don't silently lose them on incremental install.
+        existing.packages.iter().map(|p| p.name.clone()).collect()
+    } else {
+        existing.metadata.roots.clone()
+    };
+    let before = all_roots.len();
+    for r in prior_roots {
+        if !all_roots.contains(&r) {
+            all_roots.push(r);
+        }
+    }
+    if all_roots.len() > before {
+        println!(
+            "  {} merging with {} prior root(s) from rv.lock",
+            "↻".blue(),
+            all_roots.len() - before
+        );
+    }
+}
+
+// Then parse all_roots instead of packages:
+let parsed: Vec<source::PackageSource> = all_roots
+    .iter()
+    .map(|s| source::PackageSource::parse(s))
+    .collect::<Result<Vec<_>>>()?;
+
     let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names).await?;
 
     // write rv.lock immediately after resolve succeeds, so:
     //   - `rv why` works mid-failure (it reads rv.lock)
     //   - `rv install --retry` has a lockfile to read
     //   - The lockfile reflects intent, not just successful completion
-    let lockfile_path = lockfile::write(&resolved)?;
+    let lockfile_path = lockfile::write(&resolved, &all_roots)?;
     println!(
         "  {} Wrote {} ({} packages)",
         "→".dimmed(),
@@ -628,7 +659,7 @@ async fn cmd_lock(packages: &[String]) -> Result<()> {
     let root_names = sat_resolver::prepare_github_packages(&mut registry, &parsed).await?;
     let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names).await?;
 
-    let lockfile_path = lockfile::write(&resolved)?;
+    let lockfile_path = lockfile::write(&resolved,packages)?;
 
     println!(
         "\n{} Written to {} ({} packages)",
@@ -759,6 +790,7 @@ async fn cmd_restore() -> Result<()> {
                     dependencies: pkg.deps.clone(),
                     sha256: pkg.sha256.clone(),
                     github_source,
+                    system_requirements: None,
                 }
             })
             .collect(),
