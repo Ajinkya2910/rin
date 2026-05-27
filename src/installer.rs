@@ -156,7 +156,7 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> 
                     installed.insert(name);
                 }
                 Err(e) => {
-                    let err_msg = e.to_string();
+                    let err_msg = format!("{:#}", e);
                     // Bug #6: only retry on a probe-confirmed race. The [LAZY_RACE]
                     // marker is set by parse_compile_error after loadNamespace
                     // succeeded standalone. A bare "lazy loading failed" without
@@ -382,6 +382,17 @@ fn github_cache_dir() -> Result<PathBuf> {
     std::fs::create_dir_all(&base)?;
     Ok(base)
 }
+fn extract_quoted(line: &str) -> Option<&str> {
+    for (open, close) in &[('\'', '\''), ('\u{2018}', '\u{2019}'), ('"', '"')] {
+        if let Some(start) = line.find(*open) {
+            let after = &line[start + open.len_utf8()..];
+            if let Some(end) = after.find(*close) {
+                return Some(&after[..end]);
+            }
+        }
+    }
+    None
+}
 /// Run `R CMD INSTALL` against a tarball OR an extracted package directory.
 /// R CMD INSTALL accepts both — that's why this helper works for both paths.
 fn run_r_cmd_install(target: &PathBuf, pkg_name: &str) -> Result<()> {
@@ -414,7 +425,7 @@ fn run_r_cmd_install(target: &PathBuf, pkg_name: &str) -> Result<()> {
         let new_ld = if existing_ld.is_empty() {
             lib_dir
         } else {
-            format!("{}:{}", lib_dir, existing_ld)
+            format!("{}:{}", existing_ld, lib_dir)
         };
         cmd.env(ld_var, new_ld);
     }
@@ -422,7 +433,12 @@ fn run_r_cmd_install(target: &PathBuf, pkg_name: &str) -> Result<()> {
     let output = cmd.output().context("R is not installed")?;
 
     if !output.status.success() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let combined = format!(
+            "=== stdout ===\n{}\n\n=== stderr ===\n{}",
+            stdout, stderr
+        );
 
         // Persist the full stderr for debugging — friendly_error below
         // is a one-line summary; users need the real output too.
@@ -443,41 +459,6 @@ fn run_r_cmd_install(target: &PathBuf, pkg_name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Result of probing whether a package's namespace actually loads.
-enum ProbeResult {
-    Loaded,
-    Failed(String),
-    ProbeError(String),
-}
-
-/// Run `loadNamespace(pkg)` in a fresh R process to find the real cause
-/// of a lazy-loading failure (Bug #19). R's bare "lazy loading failed"
-/// hides ABI mismatches, missing deps, missing symbols — this surfaces them.
-fn probe_namespace_load(pkg_name: &str) -> ProbeResult {
-    if pkg_name == "unknown" || pkg_name.is_empty() {
-        return ProbeResult::ProbeError("no package name to probe".to_string());
-    }
-
-    let r_code = if let Some(venv_path) = get_venv_lib() {
-        format!(
-            "tryCatch(loadNamespace('{pkg}', lib.loc='{lib}'), \
-             error = function(e) {{ message(conditionMessage(e)); quit(status=1) }})",
-            pkg = pkg_name, lib = venv_path.display()
-        )
-    } else {
-        format!(
-            "tryCatch(loadNamespace('{pkg}'), \
-             error = function(e) {{ message(conditionMessage(e)); quit(status=1) }})",
-            pkg = pkg_name
-        )
-    };
-
-    match Command::new("R").args(["--vanilla", "--slave", "-e", &r_code]).output() {
-        Ok(out) if out.status.success() => ProbeResult::Loaded,
-        Ok(out) => ProbeResult::Failed(String::from_utf8_lossy(&out.stderr).into_owned()),
-        Err(e) => ProbeResult::ProbeError(e.to_string()),
-    }
-}
 /// Parse a compilation error and return a human-friendly message
 ///
 /// Instead of dumping 200 lines of g++ output, we extract the actual problem.
@@ -541,44 +522,40 @@ fn parse_compile_error(stderr: &str, pkg_name: &str) -> String {
     // e.g., "ERROR: lazy loading failed for package 'ggrepel'"
     // Lazy loading failure — probe for the real cause (Bugs #19, #6).
     if stderr.contains("lazy loading failed") {
-        let extracted = stderr
+    // Pattern A: dyn.load failure — surfaces ABI/library mismatches
+    if let Some(idx) = stderr.find("unable to load shared object") {
+        let chunk: String = stderr[idx..]
             .lines()
-            .find(|l| l.contains("lazy loading failed"))
-            .and_then(|l| l.split('\'').nth(1));
+            .take(3)
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty() && !l.starts_with("Calls:"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return format!(
+            "Lazy loading failed for '{}'. Real cause:\n  {}",
+            pkg_name, chunk
+        );
+    }
 
-        // Bug #6: if we couldn't extract a name from the message, fall back
-        // to the package being installed. If that's also unhelpful, the
-        // probe will return ProbeError and we won't misclassify as a race.
-        let probe_target = match extracted {
-            Some(n) if !n.is_empty() => n,
-            _ => pkg_name,
-        };
-
-        match probe_namespace_load(probe_target) {
-            ProbeResult::Loaded => {
-                // Genuine race — namespace loads cleanly in a fresh process.
-                // Marker is consumed by the orchestrator's retry logic.
-                return format!(
-                    "[LAZY_RACE] Lazy loading failed for '{}'; namespace loads cleanly standalone — parallel-install race. Retrying.",
-                    probe_target
-                );
-            }
-            ProbeResult::Failed(real_err) => {
-                let trimmed = real_err.trim();
-                return format!(
-                    "Lazy loading failed for '{}'. Real cause:\n  {}",
-                    probe_target,
-                    if trimmed.is_empty() { "<probe produced no error output>" } else { trimmed }
-                );
-            }
-            ProbeResult::ProbeError(e) => {
-                return format!(
-                    "Lazy loading failed for '{}' (probe failed: {}). See full log.",
-                    probe_target, e
-                );
-            }
+    // Pattern B: missing namespace dependency
+    if let Some(line) = stderr
+        .lines()
+        .find(|l| l.contains("there is no package called"))
+    {
+        if let Some(dep) = extract_quoted(line) {
+            return format!(
+                "Lazy loading failed for '{}'. Real cause: missing dependency '{}' — install it and retry.",
+                pkg_name, dep
+            );
         }
     }
+
+    // Fallback: known failure mode but unrecognized pattern
+    return format!(
+        "Lazy loading failed for '{}'. See full log for details.",
+        pkg_name
+    );
+}
 
     // Permission denied
     if stderr.contains("Permission denied") || stderr.contains("cannot create directory") {
@@ -831,6 +808,7 @@ pub async fn retry_install() -> Result<()> {
                     dependencies: pkg.deps.clone(),
                     sha256: pkg.sha256.clone(),
                     github_source,
+                    system_requirements: None,
                 }
             })
             .collect(),
