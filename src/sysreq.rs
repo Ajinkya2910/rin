@@ -817,21 +817,28 @@ async fn lookup_sysreqs_for_pkg(
         use_rspm && pkg.source == "cran" && client.is_some() && !*rspm_unreachable;
 
     if rspm_eligible {
-        let os = os_info.as_ref().unwrap();
-        if let Some(libs) = rspm_cache.entries.get(&pkg.name) {
-            return Some(libs.clone()); // cache hit
+    let os = os_info.as_ref().unwrap();
+    if let Some(libs) = rspm_cache.entries.get(&pkg.name) {
+        // Bug #4: cached empty result with non-empty DESCRIPTION SystemRequirements
+        // means RSPM's rule database doesn't cover this package — surface as uncertain.
+        if libs.is_empty() && pkg.system_requirements.as_deref().map_or(false, |s| !s.trim().is_empty()) {
+            return None;
         }
-        if let Some(libs) =
-            rspm::query(client.unwrap(), &pkg.name, &os.distribution, &os.release).await
-        {
-            rspm_cache.entries.insert(pkg.name.clone(), libs.clone());
-            *cache_dirty = true;
-            return Some(libs);
-        }
-        // Bug #31: first failed query marks RSPM unreachable for this run.
-        *rspm_unreachable = true;
-        // Fall through to SYSREQ_MAP.
+        return Some(libs.clone());
     }
+    if let Some(libs) =
+        rspm::query(client.unwrap(), &pkg.name, &os.distribution, &os.release).await
+    {
+        rspm_cache.entries.insert(pkg.name.clone(), libs.clone());
+        *cache_dirty = true;
+        // Same check on fresh RSPM response.
+        if libs.is_empty() && pkg.system_requirements.as_deref().map_or(false, |s| !s.trim().is_empty()) {
+            return None;
+        }
+        return Some(libs);
+    }
+    *rspm_unreachable = true;
+}
 
     // SYSREQ_MAP — for Bioc, GitHub, macOS, HPC, or RSPM fallback.
     for (r_pkg, sys_libs) in SYSREQ_MAP {

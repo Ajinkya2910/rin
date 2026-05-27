@@ -61,6 +61,9 @@ pub struct ResolvedPackage {
     pub sha256: Option<String>,
      /// Populated for GitHub packages; None for registry packages.
     pub github_source: Option<GitHubSource>,
+    /// Raw `SystemRequirements:` text from DESCRIPTION. Used by sysreq audit
+    /// as a fallback when RSPM returns empty (covers RSPM rule gaps).
+    pub system_requirements: Option<String>,
 }
 
 /// Resolve the full dependency tree for a list of requested packages.
@@ -181,7 +184,8 @@ fn resolve_recursive(
         needs_compilation: metadata.needs_compilation(),
         dependencies: dep_names,
         sha256: None,
-         github_source: None,  // Computed later during download
+         github_source: None, 
+         system_requirements: metadata.system_requirements().map(|s| s.to_string()), // Computed later during download
     });
 
     Ok(())

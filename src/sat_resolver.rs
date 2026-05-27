@@ -495,6 +495,7 @@ fn collect_with_constraints(
                 tarball_sha256: gh.tarball_sha256.clone(),
             }
         }),
+         system_requirements: metadata.system_requirements().map(|s| s.to_string()),
     });
     Ok(())
 }
