@@ -172,7 +172,7 @@ impl Registry {
         let r_version = detect_r_version()?;
 
         // Map R version to Bioconductor release
-        let bioc_version = map_bioc_version(&r_version)?;
+        let bioc_version = crate::bioc_releases::pick_for_r(&r_version).await?;
 
         // RUST CONCEPT: async/await
         // `fetch_cran_packages().await` pauses this function until the HTTP
@@ -388,29 +388,3 @@ fn detect_r_version() -> Result<String> {
     anyhow::bail!("Could not detect R version from `R --version` output")
 }
 
-/// Map R version to Bioconductor release version
-fn map_bioc_version(r_version: &str) -> Result<String> {
-    // RUST CONCEPT: match with string patterns
-    // This hardcodes the R → Bioconductor mapping.
-    // In a production version, we'd fetch this from Bioconductor's config.yaml.
-
-    // Extract major.minor from r_version (e.g., "4.4.0" → "4.4")
-    let parts: Vec<&str> = r_version.split('.').collect();
-    let major_minor = format!("{}.{}", parts[0], parts[1]);
-
-    let bioc = match major_minor.as_str() {
-        "4.3" => "3.18",
-        "4.4" => "3.19",
-        "4.5" => "3.20",
-        "4.6" => "3.21",
-        _ => {
-            anyhow::bail!(
-                "Unknown R version {} — cannot determine Bioconductor release. \
-                 Supported: R 4.3-4.6",
-                r_version
-            );
-        }
-    };
-
-    Ok(bioc.to_string())
-}

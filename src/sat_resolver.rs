@@ -689,6 +689,7 @@ mod tests {
 
         Registry {
             packages,
+            github_packages: HashMap::new(),
             r_version: "4.4.0".to_string(),
             bioc_version: "3.19".to_string(),
         }
@@ -742,6 +743,7 @@ mod tests {
 
         let mut registry = Registry {
             packages,
+            github_packages: HashMap::new(), 
             r_version: "4.4.0".to_string(),
             bioc_version: "3.19".to_string(),
         };

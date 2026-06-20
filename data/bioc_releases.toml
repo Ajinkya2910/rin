@@ -1,0 +1,28 @@
+# Bioconductor release → required R version (major.minor).
+# Source: https://bioconductor.org/config.yaml (r_ver_for_bioc_ver section).
+# This is a SNAPSHOT — refreshed at runtime and cached to ~/.rv/cache/.
+# Update before each rv release: cargo run -- _refresh-bioc-releases (or just curl + edit).
+
+[[release]]
+bioc = "3.22"
+r = "4.5"
+
+[[release]]
+bioc = "3.21"
+r = "4.5"
+
+[[release]]
+bioc = "3.20"
+r = "4.4"
+
+[[release]]
+bioc = "3.19"
+r = "4.4"
+
+[[release]]
+bioc = "3.18"
+r = "4.3"
+
+[[release]]
+bioc = "3.17"
+r = "4.3"

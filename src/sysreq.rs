@@ -24,10 +24,58 @@ use std::process::Command;
 pub struct SysreqReport {
     pub found: Vec<InstalledDep>,
     pub missing: Vec<MissingDep>,
-    /// Compiled R packages with no RSPM entry AND no SYSREQ_MAP entry.
+    /// Compiled R packages with no RSPM entry AND no SYSREQ_MAP entry,
+    /// but whose DESCRIPTION declares system requirements we couldn't map.
     /// Surfaced to the user with a "consider --skip-sysreq" hint (Bug #2 UX).
-    pub uncertain: Vec<String>,
+    pub uncertain: Vec<UncertainPkg>,
 
+}
+
+/// A compiled package rv couldn't map, plus the cleaned `SystemRequirements:`
+/// tokens from its DESCRIPTION. `libs` is the single source of truth: it both
+/// gates whether the package is flagged (empty → not uncertain) and is what the
+/// advisory displays. See `normalize_sysreq`.
+#[derive(Debug)]
+pub struct UncertainPkg {
+    pub name: String,
+    pub libs: Vec<String>,
+}
+
+/// Normalize a raw `SystemRequirements:` string into displayable library tokens.
+///
+/// R's `SystemRequirements:` is unstructured free-text mixing real C libraries
+/// (`gmp`, `libpng`, `fftw3`) with things that are never libraries to install:
+/// language standards (`C++17`, `C99`) and build tools (`GNU make`). We split on
+/// commas/semicolons, strip embedded version constraints, and drop that known
+/// non-library noise. Conservative on purpose — `pandoc`, `cmake`, `java` etc.
+/// can genuinely be required, so they survive. An empty result means the package
+/// declares nothing we'd ask the user to install.
+pub fn normalize_sysreq(raw: Option<&str>) -> Vec<String> {
+    let raw = match raw {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+
+    raw.split([',', ';'])
+        .map(|token| {
+            // Drop a trailing version constraint: "gmp (>= 4.2.3)" → "gmp".
+            let token = token.split('(').next().unwrap_or(token);
+            token.trim().to_string()
+        })
+        .filter(|token| !token.is_empty())
+        .filter(|token| {
+            let lower = token.to_ascii_lowercase();
+            // Language standards: "C++", "C++11/14/17/20", "C99", "C11".
+            let is_lang_std = lower.starts_with("c++")
+                || lower == "c99"
+                || lower == "c11"
+                || lower == "c89"
+                || lower == "c90";
+            // Build tools that are always already present in a build env.
+            let is_build_tool = lower == "gnu make" || lower == "make";
+            !is_lang_std && !is_build_tool
+        })
+        .collect()
 }
 
 #[derive(Debug)]
@@ -724,7 +772,7 @@ pub async fn audit(resolved: &ResolvedDeps) -> Result<SysreqReport> {
 
     let mut required_syslibs: std::collections::HashMap<String, Vec<String>> =
         std::collections::HashMap::new();
-    let mut uncertain: Vec<String> = Vec::new();
+    let mut uncertain: Vec<UncertainPkg> = Vec::new();
     let mut cache_dirty = false;
     //  first failed RSPM query short-circuits the rest of the
     // queries this run. Avoids 3s × N timeouts on compute nodes.
@@ -750,9 +798,14 @@ pub async fn audit(resolved: &ResolvedDeps) -> Result<SysreqReport> {
             }
             None => {
                 // Pure-R packages with no entry almost certainly need nothing.
-                // Only mark compiled packages with no mapping as uncertain.
+                // Only mark compiled packages with no mapping as uncertain — and
+                // only when DESCRIPTION declares real libs after normalization
+                // (a package whose sole requirement is "C++17" needs nothing).
                 if pkg.needs_compilation && !is_in_sysreq_map(&pkg.name) {
-                    uncertain.push(pkg.name.clone());
+                    let libs = normalize_sysreq(pkg.system_requirements.as_deref());
+                    if !libs.is_empty() {
+                        uncertain.push(UncertainPkg { name: pkg.name.clone(), libs });
+                    }
                 }
             }
         }
@@ -1166,5 +1219,71 @@ mod rspm {
             }
         }
         Some(libs)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_sysreq;
+
+    #[test]
+    fn none_yields_empty() {
+        assert!(normalize_sysreq(None).is_empty());
+    }
+
+    #[test]
+    fn blank_yields_empty() {
+        assert!(normalize_sysreq(Some("   ")).is_empty());
+    }
+
+    #[test]
+    fn strips_version_constraints() {
+        assert_eq!(
+            normalize_sysreq(Some("gmp (>= 4.2.3), mpfr (>= 3.0.0)")),
+            vec!["gmp", "mpfr"]
+        );
+    }
+
+    #[test]
+    fn drops_language_standards() {
+        // A package whose sole requirement is a language standard needs nothing.
+        assert!(normalize_sysreq(Some("C++17")).is_empty());
+        assert!(normalize_sysreq(Some("C99")).is_empty());
+        assert!(normalize_sysreq(Some("C++")).is_empty());
+    }
+
+    #[test]
+    fn drops_make_keeps_real_libs() {
+        // "GNU make" is noise; libpng is a real lib that should survive.
+        assert_eq!(
+            normalize_sysreq(Some("GNU make, libpng")),
+            vec!["libpng"]
+        );
+    }
+
+    #[test]
+    fn keeps_ambiguous_tools() {
+        // Conservative: pandoc / cmake / java can genuinely be required.
+        assert_eq!(
+            normalize_sysreq(Some("pandoc, cmake, java")),
+            vec!["pandoc", "cmake", "java"]
+        );
+    }
+
+    #[test]
+    fn splits_on_semicolons_and_commas() {
+        assert_eq!(
+            normalize_sysreq(Some("fftw3; Clp, libpng")),
+            vec!["fftw3", "Clp", "libpng"]
+        );
+    }
+
+    #[test]
+    fn mixed_noise_and_libs() {
+        // Real-world-ish: language std + build tool + actual libs.
+        assert_eq!(
+            normalize_sysreq(Some("C++17, GNU make, gmp (>= 4.2.3), fftw3")),
+            vec!["gmp", "fftw3"]
+        );
     }
 }

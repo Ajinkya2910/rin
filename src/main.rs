@@ -20,6 +20,7 @@ mod installer;  // Package installation orchestration
 mod version;
 mod sat_resolver;
 mod source;
+mod bioc_releases;
 // `use` brings items into scope — like `from X import Y` in Python
 use anyhow::{Context, Result};
 use cli::Cli;
@@ -322,9 +323,7 @@ async fn cmd_install(
     println!("{}", "Resolving dependencies...".dimmed());
     let mut registry = registry::Registry::fetch().await?;
 
-    // For each gh:... spec: fetch metadata and register in the GitHub bucket.
-    // Recursively follow `Remotes:` entries that point at other GitHub repos.
-    let root_names = sat_resolver::prepare_github_packages(&mut registry, &parsed).await?;
+   
 
     // Merge incremental installs into existing rv.lock instead of clobbering.
 let mut all_roots: Vec<String> = packages.to_vec();
@@ -356,8 +355,9 @@ let parsed: Vec<source::PackageSource> = all_roots
     .iter()
     .map(|s| source::PackageSource::parse(s))
     .collect::<Result<Vec<_>>>()?;
+let root_names = sat_resolver::prepare_github_packages(&mut registry, &parsed).await?;
 
-    let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names).await?;
+let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names).await?;
 
     // write rv.lock immediately after resolve succeeds, so:
     //   - `rv why` works mid-failure (it reads rv.lock)
@@ -509,15 +509,21 @@ let parsed: Vec<source::PackageSource> = all_roots
         }
         if !report.uncertain.is_empty() {
             println!(
-                "\n{} Could not verify sysreqs for {} compiled package{}: {}",
+                "\n{} Could not verify sysreqs for {} compiled package{}:",
                 "ℹ".blue(),
                 report.uncertain.len(),
                 if report.uncertain.len() == 1 { "" } else { "s" },
-                report.uncertain.join(", ").dimmed()
             );
+            for u in &report.uncertain {
+                println!(
+                    "  {} declares: {}",
+                    u.name.bold(),
+                    u.libs.join(", ").dimmed()
+                );
+            }
             println!(
-                "  rv has no mapping for these; if their deps are present \
-                 (e.g. via module/conda), re-run with {} to silence this.",
+                "  rv couldn't map these automatically; check they're installed \
+                 (e.g. via module/conda/brew), or re-run with {} to silence this.",
                 "--skip-sysreq".bold()
             );
         }

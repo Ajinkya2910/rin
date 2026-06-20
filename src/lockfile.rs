@@ -269,6 +269,7 @@ mod tests {
                         "881ebe70a2a6c6574916925d9e3a70b66c32806ddc38a472d03f90e0a146fc00"
                             .to_string(),
                 }),
+                system_requirements: None,
             }],
             duration_secs: 0.0,
         };
@@ -283,6 +284,7 @@ mod tests {
                 r_version: "4.4.0".to_string(),
                 bioc_version: "3.19".to_string(),
                 generated_at: "0".to_string(),
+                roots: vec![],
             },
             packages: vec![LockedPackage {
                 name: resolved.packages[0].name.clone(),

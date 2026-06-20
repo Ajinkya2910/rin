@@ -177,6 +177,27 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> 
         save_install_state(&installed, &failed)?;
     }
 
+    // Sweep for packages that were never attempted because a dependency
+    // failed (or got blocked itself), or because of a dependency cycle.
+    // Without this, blocked packages silently vanish from the report: they
+    // are neither in `installed` nor `failed`, the counts don't add up, and
+    // a pure cycle would even return Ok(()) — a false success.
+    for pkg in &resolved.packages {
+        if installed.contains(&pkg.name) || failed.iter().any(|(n, _)| n == &pkg.name) {
+            continue;
+        }
+        let blocker = pkg.dependencies.iter().find(|dep| {
+            !installed.contains(*dep) && resolved.packages.iter().any(|p| &p.name == *dep)
+        });
+        let reason = match blocker {
+            Some(dep) => format!("skipped — blocked by failed/unbuilt dependency '{}'", dep),
+            None => "skipped — dependency cycle or unresolved constraint".to_string(),
+        };
+        failed.push((pkg.name.clone(), reason));
+    }
+    // Persist the final state so --retry sees the blocked packages too.
+    save_install_state(&installed, &failed)?;
+
     // Report results
     if !failed.is_empty() {
         println!(
@@ -210,97 +231,156 @@ fn install_single_package(pkg: &ResolvedPackage, bioc_version: &str) -> Result<(
         return install_from_github_tarball(pkg, gh);
     }
 
-    // ── CRAN / Bioconductor path (unchanged) ──────────────────────────────
-
-    let url = match pkg.source.as_str() {
-        "cran" => format!(
-            "https://cloud.r-project.org/src/contrib/{}_{}.tar.gz",
-            pkg.name, pkg.version
-        ),
-        "bioc" => format!(
-            "https://bioconductor.org/packages/{}/bioc/src/contrib/{}_{}.tar.gz",
-            bioc_version, pkg.name, pkg.version
-        ),
-        _ => anyhow::bail!("Unknown source: {}", pkg.source),
-    };
+    // ── CRAN / Bioconductor path ──────────────────────────────────────────
 
     let download_dir = PathBuf::from("/tmp/rv-downloads");
     std::fs::create_dir_all(&download_dir)?;
 
-    let _clean_version = if let Some(pos) = pkg.version.rfind('-') {
-        let suffix = &pkg.version[pos + 1..];
-        if suffix.len() <= 2 && suffix.chars().all(|c| c.is_ascii_digit()) {
-            pkg.version[..pos].to_string()
-        } else {
-            pkg.version.clone()
-        }
-    } else {
-        pkg.version.clone()
-    };
-
     let tarball_path = download_dir.join(format!("{}_{}.tar.gz", pkg.name, pkg.version));
-    if tarball_path.exists() {
-        let size = std::fs::metadata(&tarball_path).map(|m| m.len()).unwrap_or(0);
-        if size < 1000 {
+
+    // Reuse a previously downloaded tarball only if it looks complete.
+    let cached_ok = tarball_path.exists()
+        && std::fs::metadata(&tarball_path).map(|m| m.len()).unwrap_or(0) > 1000;
+
+    if !cached_ok {
+        if tarball_path.exists() {
             std::fs::remove_file(&tarball_path).ok();
+        }
+
+        // Try each known location in priority order. For CRAN this now includes
+        // the Archive, where every superseded version lives — without it, any
+        // lockfile pinning a non-latest version can never be downloaded.
+        let candidates = candidate_urls(pkg, bioc_version)?;
+        let mut downloaded = false;
+        for url in &candidates {
+            if download_tarball_curl(url, &tarball_path) {
+                downloaded = true;
+                break;
+            }
+            // Drop any partial/error body before trying the next candidate.
+            std::fs::remove_file(&tarball_path).ok();
+        }
+
+        if !downloaded {
+            anyhow::bail!(
+                "Failed to download {} {} from any known location (live repo, CRAN Archive, fallbacks).\n  Tried:\n    {}",
+                pkg.name,
+                pkg.version,
+                candidates.join("\n    ")
+            );
         }
     }
 
-    if !tarball_path.exists() {
-        let _ = Command::new("curl")
-            .args(["-sL", "-o"])
-            .arg(&tarball_path)
-            .arg(&url)
-            .status()
-            .context("curl not found — install curl")?;
-
-        let got_real_file = tarball_path.exists()
-            && std::fs::metadata(&tarball_path).map(|m| m.len()).unwrap_or(0) > 1000;
-
-        if !got_real_file {
+    // Bug #4: integrity check. When the lockfile carries a hash for this
+    // package, verify the downloaded bytes match before installing. CRAN/Bioc
+    // entries currently have no hash (sha256 = None), so this is a no-op for
+    // them today — it activates automatically once the resolver records one.
+    if let Some(expected) = pkg.sha256.as_deref().filter(|s| !s.is_empty()) {
+        let actual = sha256_file(&tarball_path)?;
+        if !actual.eq_ignore_ascii_case(expected) {
             std::fs::remove_file(&tarball_path).ok();
-
-            if let Some(pos) = pkg.version.rfind('-') {
-                let stripped = &pkg.version[..pos];
-                let alt_url = format!(
-                    "https://cloud.r-project.org/src/contrib/{}_{}.tar.gz",
-                    pkg.name, stripped
-                );
-                let alt_path = download_dir.join(format!("{}_{}.tar.gz", pkg.name, stripped));
-
-                Command::new("curl")
-                    .args(["-sL", "-o"])
-                    .arg(&alt_path)
-                    .arg(&alt_url)
-                    .status()?;
-
-                if alt_path.exists()
-                    && std::fs::metadata(&alt_path).map(|m| m.len()).unwrap_or(0) > 1000
-                {
-                    std::fs::rename(&alt_path, &tarball_path).ok();
-                }
-            }
-        }
-
-        if !tarball_path.exists()
-            || std::fs::metadata(&tarball_path).map(|m| m.len()).unwrap_or(0) < 1000
-        {
-            std::fs::remove_file(&tarball_path).ok();
-            let annotation_url = url.replace("/bioc/", "/data/annotation/");
-            let status = Command::new("curl")
-                .args(["-sL", "-o"])
-                .arg(&tarball_path)
-                .arg(&annotation_url)
-                .status()?;
-
-            if !status.success() {
-                anyhow::bail!("Failed to download {} from any repo", pkg.name);
-            }
+            anyhow::bail!(
+                "Integrity check failed for {} {}:\n  expected {}\n  got      {}\n  \
+                 Downloaded tarball does not match the lockfile — removed it. Re-run to retry.",
+                pkg.name,
+                pkg.version,
+                expected,
+                actual
+            );
         }
     }
 
     run_r_cmd_install(&tarball_path, &pkg.name)?;
     Ok(())
+}
+
+/// Build the ordered list of URLs to try for a CRAN/Bioc source tarball.
+///
+/// CRAN keeps only the *current* version under /src/contrib/; every previous
+/// version is moved to /src/contrib/Archive/{pkg}/. A lockfile pins exact
+/// versions, so restoring an environment routinely needs the Archive path.
+fn candidate_urls(pkg: &ResolvedPackage, bioc_version: &str) -> Result<Vec<String>> {
+    let mut urls = Vec::new();
+
+    match pkg.source.as_str() {
+        "cran" => {
+            // Live repo (only holds the latest version).
+            urls.push(format!(
+                "https://cloud.r-project.org/src/contrib/{}_{}.tar.gz",
+                pkg.name, pkg.version
+            ));
+            // Archive (superseded versions).
+            urls.push(format!(
+                "https://cloud.r-project.org/src/contrib/Archive/{}/{}_{}.tar.gz",
+                pkg.name, pkg.name, pkg.version
+            ));
+
+            // Version-suffix normalization (e.g. "1.0-1" -> "1.0"): try the
+            // stripped form against both live and archive too.
+            if let Some(pos) = pkg.version.rfind('-') {
+                let suffix = &pkg.version[pos + 1..];
+                if suffix.len() <= 2 && suffix.chars().all(|c| c.is_ascii_digit()) {
+                    let stripped = &pkg.version[..pos];
+                    urls.push(format!(
+                        "https://cloud.r-project.org/src/contrib/{}_{}.tar.gz",
+                        pkg.name, stripped
+                    ));
+                    urls.push(format!(
+                        "https://cloud.r-project.org/src/contrib/Archive/{}/{}_{}.tar.gz",
+                        pkg.name, pkg.name, stripped
+                    ));
+                }
+            }
+        }
+        "bioc" => {
+            // Bioconductor splits packages across categories; we don't always
+            // know which one a package belongs to, so try each.
+            for cat in ["bioc", "data/annotation", "data/experiment", "workflows"] {
+                urls.push(format!(
+                    "https://bioconductor.org/packages/{}/{}/src/contrib/{}_{}.tar.gz",
+                    bioc_version, cat, pkg.name, pkg.version
+                ));
+            }
+        }
+        other => anyhow::bail!("Unknown source: {}", other),
+    }
+
+    Ok(urls)
+}
+
+/// Download `url` to `dest` with curl. Returns true only if a real tarball
+/// landed. `-f` makes curl fail (non-zero, no body written) on HTTP >= 400,
+/// so a 404 from the live repo doesn't leave an HTML error page behind.
+fn download_tarball_curl(url: &str, dest: &PathBuf) -> bool {
+    let status = Command::new("curl")
+        .args([
+            "-fsSL",
+            "--retry",
+            "3",
+            "--retry-delay",
+            "1",
+            "--max-time",
+            "300",
+            "-o",
+        ])
+        .arg(dest)
+        .arg(url)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0) > 1000
+        }
+        _ => false,
+    }
+}
+
+/// Compute the hex-encoded SHA-256 of a file.
+fn sha256_file(path: &PathBuf) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("reading {} for integrity check", path.display()))?;
+    Ok(hex::encode(Sha256::digest(&bytes)))
 }
 
 /// Install a GitHub-sourced package from its already-downloaded tarball.
@@ -446,9 +526,9 @@ fn run_r_cmd_install(target: &PathBuf, pkg_name: &str) -> Result<()> {
             "/tmp/rv-fail-{}.log",
             pkg_name
         ));
-        let _ = std::fs::write(&log_path, stderr.as_bytes());
+        let _ = std::fs::write(&log_path, combined.as_bytes());
 
-        let friendly_error = parse_compile_error(&stderr, pkg_name);
+        let friendly_error = parse_compile_error(&combined, pkg_name);
         anyhow::bail!(
             "{}\n  Full output: {}",
             friendly_error,
