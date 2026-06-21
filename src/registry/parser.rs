@@ -214,13 +214,14 @@ pub fn parse_description(text: &str) -> Result<ParsedDescription> {
 /// Parse a comma-separated dependency list:
 ///   "R (>= 4.4.0), methods, BiocGenerics (>= 0.44.0)"
 /// into a Vec<Dependency>, dropping base R packages.
-fn parse_dependency_list(input: &str) -> Vec<Dependency> {
-    const BASE_PACKAGES: &[&str] = &[
-        "base", "compiler", "datasets", "grDevices", "graphics",
-        "grid", "methods", "parallel", "splines", "stats", "stats4",
-        "tcltk", "tools", "utils",
-    ];
+/// Packages that ship with R itself — never installed as dependencies.
+const BASE_PACKAGES: &[&str] = &[
+    "base", "compiler", "datasets", "grDevices", "graphics",
+    "grid", "methods", "parallel", "splines", "stats", "stats4",
+    "tcltk", "tools", "utils",
+];
 
+fn parse_dependency_list(input: &str) -> Vec<Dependency> {
     input
         .split(',')
         .map(|s| s.trim())
@@ -262,11 +263,186 @@ fn parse_linking_to(input: &str) -> Vec<String> {
         .collect()
 }
 
+// --- NAMESPACE parsing ------------------------------------------------------
+
+/// Extract the package names a NAMESPACE file imports from.
+///
+/// Some packages (notably on GitHub) `importFrom(pkg, fn)` in NAMESPACE but
+/// forget to list `pkg` under Imports/Depends in DESCRIPTION. R's lazy-loader
+/// honors NAMESPACE, so the install crashes with "there is no package called
+/// 'pkg'". Parsing NAMESPACE lets us recover these undeclared dependencies.
+///
+/// Handles the directives that name a package:
+///   import(pkg)                     → pkg (and any further bare args)
+///   import(pkg, except = c(...))    → pkg
+///   importFrom(pkg, a, b)           → pkg  (only the first arg)
+///   importClassesFrom(pkg, ...)     → pkg
+///   importMethodsFrom(pkg, ...)     → pkg
+/// Names may be quoted (`importFrom("R.utils", gzip)`). Comments (`#`) and
+/// base packages are ignored. `useDynLib`/`export*` directives are not imports.
+pub fn parse_namespace_imports(text: &str) -> Vec<String> {
+    // Strip line comments first so a `#` inside a comment can't fool the scan.
+    let cleaned: String = text
+        .lines()
+        .map(|l| match l.find('#') {
+            Some(i) => &l[..i],
+            None => l,
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut names: Vec<String> = Vec::new();
+
+    // `import(...)`: every bare (non-named) argument is a package.
+    for args in capture_calls(&cleaned, "import") {
+        for arg in split_top_level(args) {
+            // Skip named arguments like `except = c(...)`.
+            if arg.contains('=') {
+                continue;
+            }
+            if let Some(name) = clean_namespace_token(arg) {
+                names.push(name);
+            }
+        }
+    }
+
+    // The *From directives: only the first argument is the package name.
+    for kw in ["importFrom", "importClassesFrom", "importMethodsFrom"] {
+        for args in capture_calls(&cleaned, kw) {
+            if let Some(first) = split_top_level(args).into_iter().next() {
+                if let Some(name) = clean_namespace_token(first) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+
+    // Drop base packages, "R", and duplicates while preserving order.
+    let mut seen = std::collections::HashSet::new();
+    names
+        .into_iter()
+        .filter(|n| n != "R" && !BASE_PACKAGES.contains(&n.as_str()))
+        .filter(|n| seen.insert(n.clone()))
+        .collect()
+}
+
+/// Find every `keyword(...)` call and return the raw text between the
+/// outermost parentheses, handling nested parens and multi-line calls.
+fn capture_calls<'a>(text: &'a str, keyword: &str) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    let pat = format!("{}(", keyword);
+    let mut from = 0;
+    while let Some(rel) = text[from..].find(&pat) {
+        let kw_start = from + rel;
+        // Reject matches where the keyword is a suffix of a longer identifier,
+        // e.g. don't let "import" match the tail of some other token.
+        let prev_ok = kw_start == 0
+            || !text.as_bytes()[kw_start - 1].is_ascii_alphanumeric()
+                && text.as_bytes()[kw_start - 1] != b'.'
+                && text.as_bytes()[kw_start - 1] != b'_';
+        let open = kw_start + keyword.len(); // index of '('
+        let mut depth = 0i32;
+        let mut end = None;
+        for (i, c) in text[open..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(open + i);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match (prev_ok, end) {
+            (true, Some(e)) => {
+                out.push(&text[open + 1..e]);
+                from = e + 1;
+            }
+            (_, Some(e)) => from = e + 1,
+            (_, None) => break, // unbalanced — give up scanning this keyword
+        }
+    }
+    out
+}
+
+/// Split on commas that sit at parenthesis depth 0, so `except = c(a, b)`
+/// stays a single argument.
+fn split_top_level(args: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0;
+    for (i, c) in args.char_indices() {
+        match c {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            ',' if depth == 0 => {
+                parts.push(&args[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&args[start..]);
+    parts
+}
+
+/// Trim whitespace and surrounding quotes from a NAMESPACE token, returning
+/// None if nothing usable remains.
+fn clean_namespace_token(tok: &str) -> Option<String> {
+    let t = tok.trim().trim_matches(|c| c == '"' || c == '\'').trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
 // --- Tests -----------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_namespace_imports_basic() {
+        let ns = "\
+importFrom(R.utils,gzip)
+import(Matrix)
+importFrom(\"stats\", median)
+import(methods)
+exportPattern(\"^[^\\\\.]\")
+useDynLib(mypkg)
+";
+        let imports = parse_namespace_imports(ns);
+        // R.utils and Matrix kept; stats (base) and methods (base) dropped;
+        // export/useDynLib ignored.
+        assert!(imports.contains(&"R.utils".to_string()));
+        assert!(imports.contains(&"Matrix".to_string()));
+        assert!(!imports.contains(&"stats".to_string()));
+        assert!(!imports.contains(&"methods".to_string()));
+        assert!(!imports.contains(&"mypkg".to_string()));
+    }
+
+    #[test]
+    fn test_parse_namespace_multiarg_and_named() {
+        let ns = "import(dplyr, tidyr)\nimport(rlang, except = c(foo, bar))\n";
+        let imports = parse_namespace_imports(ns);
+        assert!(imports.contains(&"dplyr".to_string()));
+        assert!(imports.contains(&"tidyr".to_string()));
+        assert!(imports.contains(&"rlang".to_string()));
+        // The named `except = c(...)` argument is not a package.
+        assert!(!imports.iter().any(|n| n.contains('=') || n == "foo" || n == "bar"));
+    }
+
+    #[test]
+    fn test_parse_namespace_comment_ignored() {
+        let ns = "# importFrom(ghost, x)\nimportFrom(real, y)\n";
+        let imports = parse_namespace_imports(ns);
+        assert_eq!(imports, vec!["real".to_string()]);
+    }
 
     #[test]
     fn test_parse_dependency_list() {

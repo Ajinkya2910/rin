@@ -22,11 +22,18 @@ use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
 /// State file path for tracking install progress (for --retry)
 const STATE_FILE: &str = ".rv-install-state.json";
+
+/// Whether to build packages with conda stripped from the environment.
+/// Decided once at the start of `install()` (see `decide_conda_exclusion`),
+/// then read by every parallel `run_r_cmd_install`. A process-global avoids
+/// threading the flag through the rayon closures.
+static EXCLUDE_CONDA: AtomicBool = AtomicBool::new(false);
 
 /// Install all resolved packages in dependency order with parallelism.
 ///
@@ -53,13 +60,25 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> 
         );
     }
 
+    // macOS-only: an active conda env makes R link compiled packages against
+    // conda's libs, which then fail to load via @rpath. Offer to build with
+    // conda excluded. On Linux/HPC conda is often the intended toolchain, so
+    // `decide_conda_exclusion` returns false there and we keep the Bug #16
+    // injection advisory below.
+    let exclude_conda = decide_conda_exclusion();
+    EXCLUDE_CONDA.store(exclude_conda, Ordering::Relaxed);
+
     // Bug #16: one-time advisory so users see why their conda libs are visible.
-    if let Some((pkgconfig_dir, _)) = conda_env_additions() {
-        println!(
-            "  {} conda env detected: prepending {} to PKG_CONFIG_PATH",
-            "ℹ".blue(),
-            pkgconfig_dir.dimmed()
-        );
+    // Suppressed when we're excluding conda (decide_conda_exclusion already
+    // printed what it's doing).
+    if !exclude_conda {
+        if let Some((pkgconfig_dir, _)) = conda_env_additions() {
+            println!(
+                "  {} conda env detected: prepending {} to PKG_CONFIG_PATH",
+                "ℹ".blue(),
+                pkgconfig_dir.dimmed()
+            );
+        }
     }
     let total = resolved.packages.len();
     let mut installed: HashSet<String> = HashSet::new();
@@ -351,8 +370,15 @@ fn candidate_urls(pkg: &ResolvedPackage, bioc_version: &str) -> Result<Vec<Strin
 /// Download `url` to `dest` with curl. Returns true only if a real tarball
 /// landed. `-f` makes curl fail (non-zero, no body written) on HTTP >= 400,
 /// so a 404 from the live repo doesn't leave an HTML error page behind.
+///
+/// We `.output()` rather than `.status()` so curl's stderr is captured, not
+/// inherited. Each candidate URL is tried in priority order (live repo, then
+/// Archive), so a 404 on the first attempt is *expected* and routine — letting
+/// curl print `curl: (22) ... 404` to the terminal would corrupt the progress
+/// bar with noise for a non-error. If every candidate fails, the caller's
+/// `bail!` already reports the full list of URLs tried.
 fn download_tarball_curl(url: &str, dest: &PathBuf) -> bool {
-    let status = Command::new("curl")
+    let output = Command::new("curl")
         .args([
             "-fsSL",
             "--retry",
@@ -365,10 +391,10 @@ fn download_tarball_curl(url: &str, dest: &PathBuf) -> bool {
         ])
         .arg(dest)
         .arg(url)
-        .status();
+        .output();
 
-    match status {
-        Ok(s) if s.success() => {
+    match output {
+        Ok(o) if o.status.success() => {
             std::fs::metadata(dest).map(|m| m.len()).unwrap_or(0) > 1000
         }
         _ => false,
@@ -402,12 +428,13 @@ fn install_from_github_tarball(
         .join(&gh.repo)
         .join(format!("{}.tar.gz", gh.commit_sha));
 
+    // The resolver normally populates this during the resolve phase. But the
+    // cache can be evicted between resolve and install (manual cleanup, a TMP
+    // sweep, a separate `rv` run). Rather than dead-end the user with "try
+    // re-running", re-fetch the exact pinned SHA on demand and verify it against
+    // the lockfile's recorded hash.
     if !tarball_path.exists() {
-        anyhow::bail!(
-            "GitHub tarball missing from cache: {}\n\
-             Expected the resolver to have populated this. Try re-running.",
-            tarball_path.display()
-        );
+        redownload_github_tarball(gh, &cache_dir, &tarball_path)?;
     }
 
     // Unique temp dir per (owner, repo, full-sha) — no collision risk.
@@ -444,6 +471,68 @@ fn install_from_github_tarball(
     }
 }
 
+/// Re-fetch a GitHub tarball that's gone missing from the cache between
+/// resolve and install. Downloads the exact pinned commit SHA and verifies
+/// the bytes against the SHA-256 recorded at resolve time, so a re-download
+/// can never silently substitute different contents.
+///
+/// Runs from a sync rayon worker, so it spins up a small current-thread tokio
+/// runtime to drive the async download rather than borrowing the outer one.
+fn redownload_github_tarball(
+    gh: &crate::resolver::GitHubSource,
+    cache_dir: &PathBuf,
+    tarball_path: &PathBuf,
+) -> Result<()> {
+    eprintln!(
+        "  {} re-fetching {}/{}@{} (missing from cache)",
+        "↻", gh.owner, gh.repo, &gh.commit_sha[..gh.commit_sha.len().min(7)]
+    );
+
+    let spec = crate::source::GitHubSpec {
+        owner: gh.owner.clone(),
+        repo: gh.repo.clone(),
+        r#ref: Some(gh.commit_sha.clone()),
+        subdir: gh.subdir.clone(),
+    };
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("Failed to start runtime for tarball re-download")?;
+    let client = reqwest::Client::new();
+    let (_, digest) = rt
+        .block_on(crate::registry::github::download_tarball(
+            &spec,
+            &gh.commit_sha,
+            cache_dir,
+            &client,
+        ))
+        .with_context(|| {
+            format!(
+                "Re-downloading {}/{}@{} from GitHub",
+                gh.owner, gh.repo, gh.commit_sha
+            )
+        })?;
+
+    // Integrity gate: the re-downloaded bytes must match what the lockfile
+    // pinned. A mismatch means the upstream ref moved or the cache is poisoned.
+    if !gh.tarball_sha256.is_empty() && digest != gh.tarball_sha256 {
+        anyhow::bail!(
+            "Re-downloaded tarball for {}/{}@{} has SHA-256 {} but the lockfile \
+             expected {}. Refusing to install mismatched contents.",
+            gh.owner, gh.repo, gh.commit_sha, digest, gh.tarball_sha256
+        );
+    }
+
+    if !tarball_path.exists() {
+        anyhow::bail!(
+            "Re-download reported success but tarball is still missing: {}",
+            tarball_path.display()
+        );
+    }
+    Ok(())
+}
+
 /// Extract a .tar.gz into a destination directory.
 fn extract_tarball(tarball: &PathBuf, dest: &PathBuf) -> Result<()> {
     let file = std::fs::File::open(tarball)?;
@@ -462,6 +551,98 @@ fn github_cache_dir() -> Result<PathBuf> {
     std::fs::create_dir_all(&base)?;
     Ok(base)
 }
+/// Turn a "symbol not found" dlopen failure into an actionable
+/// build-vs-runtime version-mismatch message. `chunk` is the joined dyld error
+/// text (the `.so` path and the missing symbol).
+fn explain_symbol_mismatch(pkg_name: &str, chunk: &str) -> String {
+    let symbol = extract_missing_symbol(chunk);
+    let culprit = extract_so_package(chunk);
+    let lib = symbol.as_deref().and_then(guess_system_lib);
+
+    let culprit_str = culprit
+        .as_deref()
+        .map(|p| format!(" ({})", p))
+        .unwrap_or_default();
+    let symbol_str = symbol
+        .as_deref()
+        .map(|s| format!(" (missing symbol {})", s))
+        .unwrap_or_default();
+
+    let mut msg = format!(
+        "Lazy loading failed for '{}'. Real cause: a compiled dependency{} was built \
+         against one version of its system library but is loading a different one{}.\n  \
+         This is a build/runtime version mismatch, not a missing R package.",
+        pkg_name, culprit_str, symbol_str
+    );
+
+    let rebuild = culprit.as_deref().unwrap_or("<package>");
+    match lib {
+        Some("HDF5") => msg.push_str(&format!(
+            "\n  HDF5: Homebrew ships 2.x, but hdf5r needs the 1.10–1.14 API. Rebuild against 1.x:\n    \
+               brew install hdf5@1.10 && brew unlink hdf5 && brew link --overwrite --force hdf5@1.10\n    \
+               rm -rf \"$(R RHOME)\"/../{0} ; rv install {0}\n    \
+               (afterward: brew unlink hdf5@1.10 && brew link hdf5  — keeps gdal/netcdf working)\n  \
+             Or sidestep entirely: conda install -c conda-forge r-hdf5r",
+            rebuild
+        )),
+        Some(other) => msg.push_str(&format!(
+            "\n  Ensure only one version of {} is active (check: otool -L / ldd on the .so), \
+             then rebuild {}: rv install {}",
+            other, rebuild, rebuild
+        )),
+        None => msg.push_str(
+            "\n  Inspect which library it links (otool -L on macOS, ldd on Linux), make one \
+             consistent version active, then rebuild the offending dependency.",
+        ),
+    }
+    msg
+}
+
+/// Pull the missing symbol name out of a dyld error, e.g. `_H5Dread_chunk`.
+/// Handles both the flat-namespace form and newer "Symbol not found:" form.
+fn extract_missing_symbol(s: &str) -> Option<String> {
+    if let Some(i) = s.find("flat namespace ") {
+        return extract_quoted(&s[i..]).map(|x| x.to_string());
+    }
+    if let Some(i) = s.find("Symbol not found:") {
+        let rest = s[i + "Symbol not found:".len()..].trim();
+        let sym: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
+        if !sym.is_empty() {
+            return Some(sym);
+        }
+    }
+    None
+}
+
+/// From a dlopen error mentioning `.../<pkg>/libs/<pkg>.so`, recover `<pkg>`.
+fn extract_so_package(s: &str) -> Option<String> {
+    let path = s.split('\'').find(|seg| seg.contains(".so"))?;
+    let file = path.rsplit('/').next()?;
+    let stem = file.strip_suffix(".so")?;
+    if stem.is_empty() {
+        None
+    } else {
+        Some(stem.to_string())
+    }
+}
+
+/// Map a missing C symbol to the system library it belongs to, when the prefix
+/// is recognizable. Drives a library-specific remediation hint.
+fn guess_system_lib(symbol: &str) -> Option<&'static str> {
+    let s = symbol.trim_start_matches('_');
+    if s.starts_with("H5") {
+        Some("HDF5")
+    } else if s.starts_with("GDAL") || s.starts_with("OGR") {
+        Some("GDAL")
+    } else if s.starts_with("proj_") || s.starts_with("pj_") {
+        Some("PROJ")
+    } else if s.starts_with("GEOS") {
+        Some("GEOS")
+    } else {
+        None
+    }
+}
+
 fn extract_quoted(line: &str) -> Option<&str> {
     for (open, close) in &[('\'', '\''), ('\u{2018}', '\u{2019}'), ('"', '"')] {
         if let Some(start) = line.find(*open) {
@@ -485,9 +666,15 @@ fn run_r_cmd_install(target: &PathBuf, pkg_name: &str) -> Result<()> {
     }
     cmd.arg(target);
 
-    // Bug #16: propagate conda env libs into the build subprocess.
-    // Prepend so user-set values still win for collisions.
-    if let Some((pkgconfig_dir, lib_dir)) = conda_env_additions() {
+    if EXCLUDE_CONDA.load(Ordering::Relaxed) {
+        // User opted to build conda-free: strip conda from the subprocess env
+        // so R links against system/Homebrew libs instead of conda's.
+        if let Ok(prefix) = std::env::var("CONDA_PREFIX") {
+            sanitize_conda_from_cmd(&mut cmd, &prefix);
+        }
+    } else if let Some((pkgconfig_dir, lib_dir)) = conda_env_additions() {
+        // Bug #16: propagate conda env libs into the build subprocess.
+        // Prepend so user-set values still win for collisions.
         let existing_pc = std::env::var("PKG_CONFIG_PATH").unwrap_or_default();
         let new_pc = if existing_pc.is_empty() {
             pkgconfig_dir
@@ -611,6 +798,15 @@ fn parse_compile_error(stderr: &str, pkg_name: &str) -> String {
             .filter(|l| !l.is_empty() && !l.starts_with("Calls:"))
             .collect::<Vec<_>>()
             .join(" ");
+
+        // A "symbol not found" dlopen failure means a compiled package was
+        // built against one version of a system library but is loading a
+        // different one at runtime — not a missing package. Translate the raw
+        // dyld message into a version-mismatch diagnosis with the fix.
+        if chunk.contains("symbol not found") || chunk.contains("Symbol not found") {
+            return explain_symbol_mismatch(pkg_name, &chunk);
+        }
+
         return format!(
             "Lazy loading failed for '{}'. Real cause:\n  {}",
             pkg_name, chunk
@@ -764,6 +960,120 @@ fn conda_env_additions() -> Option<(String, String)> {
         prefix_path.join("lib").display().to_string(),
     ))
 }
+
+/// macOS-only: decide whether to build with conda excluded from the environment.
+///
+/// Returns false (keep current behavior) when no conda env is active, or when
+/// not on macOS — on Linux/HPC conda is often the intended toolchain and the
+/// `@rpath` dlopen failure that motivates this is dyld-specific.
+///
+/// On macOS with conda active: warn, then prompt [Y/n] (default Y). A
+/// non-interactive run can't answer, so it defaults to conda-free (the safe
+/// choice) and prints a notice instead of blocking.
+fn decide_conda_exclusion() -> bool {
+    use colored::Colorize;
+    use std::io::{IsTerminal, Write};
+
+    // Only relevant when a conda env with real libs is active.
+    if conda_env_additions().is_none() {
+        return false;
+    }
+    // dyld-specific problem — scope to macOS.
+    if std::env::consts::OS != "macos" {
+        return false;
+    }
+
+    let prefix = std::env::var("CONDA_PREFIX").unwrap_or_default();
+    println!(
+        "  {} conda env active ({})",
+        "⚠".yellow(),
+        prefix.dimmed()
+    );
+    println!(
+        "    Building against conda libs often fails to load on macOS (@rpath errors)."
+    );
+
+    // Non-interactive (CI, piped input): default to the safe choice.
+    if !std::io::stdin().is_terminal() {
+        println!(
+            "    {} non-interactive — building with a conda-free environment.",
+            "ℹ".blue()
+        );
+        return true;
+    }
+
+    print!("    Build with conda excluded from the environment? [Y/n] ");
+    let _ = std::io::stdout().flush();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return true; // can't read — default safe
+    }
+    let ans = line.trim().to_ascii_lowercase();
+    let exclude = !(ans == "n" || ans == "no");
+    println!(
+        "    {} {}",
+        "→".blue(),
+        if exclude {
+            "building with a conda-free environment".to_string()
+        } else {
+            "keeping conda on the build environment".to_string()
+        }
+    );
+    exclude
+}
+
+/// Strip conda from a build subprocess's environment, mirroring what
+/// `conda deactivate` would do — without touching the user's shell.
+/// Removes conda marker vars and any conda-prefixed entries from the
+/// path-like vars that steer the compiler/linker.
+fn sanitize_conda_from_cmd(cmd: &mut Command, prefix: &str) {
+    for var in ["CONDA_PREFIX", "CONDA_DEFAULT_ENV", "CONDA_PROMPT_MODIFIER"] {
+        cmd.env_remove(var);
+    }
+
+    for var in [
+        "PKG_CONFIG_PATH",
+        "DYLD_LIBRARY_PATH",
+        "DYLD_FALLBACK_LIBRARY_PATH",
+    ] {
+        if let Ok(val) = std::env::var(var) {
+            let cleaned = strip_conda_entries(&val, prefix);
+            if cleaned.is_empty() {
+                cmd.env_remove(var);
+            } else {
+                cmd.env(var, cleaned);
+            }
+        }
+    }
+
+    // PATH: only strip conda if R itself doesn't live under the conda prefix —
+    // otherwise we'd remove the very R we're about to invoke.
+    if let Ok(path) = std::env::var("PATH") {
+        if !r_binary_under(prefix) {
+            cmd.env("PATH", strip_conda_entries(&path, prefix));
+        }
+    }
+}
+
+/// Drop ':'-separated entries that live under `prefix` (and empties).
+fn strip_conda_entries(value: &str, prefix: &str) -> String {
+    value
+        .split(':')
+        .filter(|e| !e.is_empty() && !e.starts_with(prefix))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// Does the `R` on PATH resolve to a path under `prefix` (i.e. conda's own R)?
+fn r_binary_under(prefix: &str) -> bool {
+    Command::new("which")
+        .arg("R")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().starts_with(prefix))
+        .unwrap_or(false)
+}
 /// Return the set of all package names currently installed in the
 /// active R library (venv if active, system library otherwise).
 ///
@@ -795,15 +1105,54 @@ pub fn list_installed_packages() -> std::collections::HashSet<String> {
 }
 /// Check which packages from the resolved set are already installed
 pub fn check_installed_versions(packages: &[ResolvedPackage]) -> Vec<String> {
+    if packages.is_empty() {
+        return Vec::new();
+    }
 
-    let r_code = if let Some(venv_path) = get_venv_lib() {
-        format!(
-            "ip <- installed.packages(lib.loc='{}'); cat(paste(ip[,'Package'], ip[,'Version']), sep='\\n')",
-            venv_path.display()
-        )
-    } else {
-        "ip <- installed.packages(); cat(paste(ip[,'Package'], ip[,'Version']), sep='\\n')".to_string()
+    // We only verify packages in the resolved set, so embed those names as an
+    // R vector. Single quotes can't appear in R package names, so stripping
+    // them is enough to keep the literal safe.
+    let candidates_r = packages
+        .iter()
+        .map(|p| format!("'{}'", p.name.replace('\'', "")))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    // Setup differs only in whether a venv lib dir is prepended to the search
+    // path. Prepending (not replacing) lets loadNamespace() resolve a compiled
+    // package's dependencies from the venv first, base R packages second.
+    let lib_setup = match get_venv_lib() {
+        Some(venv_path) => format!(
+            ".libPaths(c('{p}', .libPaths())); loc <- '{p}'",
+            p = venv_path.display()
+        ),
+        None => "loc <- NULL".to_string(),
     };
+
+    // installed.packages() only proves a package is *registered*, not that its
+    // shared object still loads. A cached build can link against a library that
+    // has since left the search path (e.g. a conda lib after `conda deactivate`),
+    // leaving a registered-but-unloadable package. For packages that ship
+    // compiled code (a `libs/` dir), gate "installed" on loadNamespace()
+    // actually succeeding — that triggers the dlopen and surfaces a stale link,
+    // so the package is rebuilt instead of silently skipped. Pure-R packages
+    // can't hit this and skip the (slower) load probe.
+    let r_code = format!(
+        "{lib_setup}\n\
+         ip <- installed.packages(lib.loc=loc)\n\
+         for (p in c({candidates})) {{\n\
+           if (!(p %in% rownames(ip))) next\n\
+           ver <- ip[p, 'Version']\n\
+           dir <- tryCatch(find.package(p, quiet=TRUE), error=function(e) NA_character_)\n\
+           ok <- TRUE\n\
+           if (!is.na(dir) && dir.exists(file.path(dir, 'libs'))) {{\n\
+             ok <- tryCatch({{ loadNamespace(p); TRUE }}, error=function(e) FALSE)\n\
+           }}\n\
+           if (ok) cat(p, ver, '\\n')\n\
+         }}",
+        lib_setup = lib_setup,
+        candidates = candidates_r,
+    );
 
     let output = Command::new("R")
         .args(["--vanilla", "--slave", "-e", &r_code])
@@ -812,12 +1161,12 @@ pub fn check_installed_versions(packages: &[ResolvedPackage]) -> Vec<String> {
     match output {
         Ok(out) if out.status.success() => {
             let installed_str = String::from_utf8_lossy(&out.stdout);
-            
-            // Build a map of package name → installed version
-            let mut installed_map: std::collections::HashMap<&str, &str> = 
+
+            // Build a map of package name → loadable installed version
+            let mut installed_map: std::collections::HashMap<&str, &str> =
                 std::collections::HashMap::new();
             for line in installed_str.lines() {
-                let parts: Vec<&str> = line.splitn(2, ' ').collect();
+                let parts: Vec<&str> = line.split_whitespace().collect();
                 if parts.len() == 2 {
                     installed_map.insert(parts[0], parts[1]);
                 }
@@ -943,4 +1292,55 @@ fn load_install_state() -> Result<InstallState> {
 
     let state: InstallState = serde_json::from_str(&content)?;
     Ok(state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{explain_symbol_mismatch, guess_system_lib, strip_conda_entries};
+
+    #[test]
+    fn symbol_mismatch_identifies_hdf5_and_culprit() {
+        // The exact failure shape from SeuratDisk loading a bad hdf5r.so.
+        let chunk = "unable to load shared object \
+            '/Users/x/.rv/lib/hdf5r/libs/hdf5r.so': \
+            dlopen(/Users/x/.rv/lib/hdf5r/libs/hdf5r.so, 0x0006): \
+            symbol not found in flat namespace '_H5Dread_chunk'";
+        let msg = explain_symbol_mismatch("SeuratDisk", chunk);
+        assert!(msg.contains("version mismatch"));
+        assert!(msg.contains("hdf5r")); // recovered the offending package
+        assert!(msg.contains("_H5Dread_chunk")); // named the symbol
+        assert!(msg.contains("hdf5@1.10")); // HDF5-specific remediation
+    }
+
+    #[test]
+    fn guess_system_lib_maps_prefixes() {
+        assert_eq!(guess_system_lib("_H5Dread_chunk"), Some("HDF5"));
+        assert_eq!(guess_system_lib("GDALOpen"), Some("GDAL"));
+        assert_eq!(guess_system_lib("_proj_create"), Some("PROJ"));
+        assert_eq!(guess_system_lib("_some_random_sym"), None);
+    }
+
+    #[test]
+    fn strips_only_conda_prefixed_entries() {
+        let prefix = "/opt/homebrew/anaconda3";
+        let path = "/opt/homebrew/anaconda3/bin:/opt/homebrew/bin:/usr/bin:/bin";
+        // Conda's bin goes; Homebrew's bin (shares the /opt/homebrew root but
+        // not the full prefix) and system dirs stay.
+        assert_eq!(
+            strip_conda_entries(path, prefix),
+            "/opt/homebrew/bin:/usr/bin:/bin"
+        );
+    }
+
+    #[test]
+    fn drops_empty_segments() {
+        let prefix = "/opt/conda";
+        assert_eq!(strip_conda_entries("/opt/conda/lib::/usr/lib", prefix), "/usr/lib");
+    }
+
+    #[test]
+    fn all_conda_yields_empty() {
+        let prefix = "/opt/conda";
+        assert_eq!(strip_conda_entries("/opt/conda/lib:/opt/conda/lib/pkgconfig", prefix), "");
+    }
 }

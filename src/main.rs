@@ -363,7 +363,12 @@ let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names
     //   - `rv why` works mid-failure (it reads rv.lock)
     //   - `rv install --retry` has a lockfile to read
     //   - The lockfile reflects intent, not just successful completion
-    let lockfile_path = lockfile::write(&resolved, &all_roots)?;
+    let lockfile_path = lockfile::write(
+        &resolved,
+        &all_roots,
+        &registry.r_version,
+        &registry.bioc_version,
+    )?;
     println!(
         "  {} Wrote {} ({} packages)",
         "→".dimmed(),
@@ -665,7 +670,12 @@ async fn cmd_lock(packages: &[String]) -> Result<()> {
     let root_names = sat_resolver::prepare_github_packages(&mut registry, &parsed).await?;
     let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names).await?;
 
-    let lockfile_path = lockfile::write(&resolved,packages)?;
+    let lockfile_path = lockfile::write(
+        &resolved,
+        packages,
+        &registry.r_version,
+        &registry.bioc_version,
+    )?;
 
     println!(
         "\n{} Written to {} ({} packages)",

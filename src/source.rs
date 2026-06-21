@@ -17,6 +17,7 @@ use anyhow::{bail, Result};
 ///
 /// Examples:
 ///   "DESeq2"             → Registry("DESeq2")
+///   "user/repo"          → GitHub(...)   (bare form, like pak/remotes)
 ///   "gh:user/repo"       → GitHub(GitHubSpec { ... })
 ///   "github::user/repo"  → GitHub(...)   (the Remotes: field form)
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +53,14 @@ impl PackageSource {
         }
         if let Some(rest) = s.strip_prefix("github::") {
             return Ok(PackageSource::GitHub(parse_github_spec(rest)?));
+        }
+        // Bare "owner/repo" form, as accepted by pak and remotes
+        // (e.g. `rv install satijalab/seurat-wrappers`). A CRAN/Bioconductor
+        // package name can only contain letters, numbers, and dots — never a
+        // slash — so any unprefixed spec containing '/' is unambiguously a
+        // GitHub repository, not a registry name.
+        if s.contains('/') {
+            return Ok(PackageSource::GitHub(parse_github_spec(s)?));
         }
         Ok(PackageSource::Registry(s.to_string()))
     }
@@ -170,6 +179,31 @@ mod tests {
         if let PackageSource::GitHub(spec) = p {
             assert_eq!(spec.owner, "satijalab");
             assert_eq!(spec.repo, "seurat-data");
+        } else {
+            panic!("expected GitHub variant");
+        }
+    }
+
+    #[test]
+    fn test_bare_owner_repo() {
+        let p = PackageSource::parse("satijalab/seurat-wrappers").unwrap();
+        if let PackageSource::GitHub(spec) = p {
+            assert_eq!(spec.owner, "satijalab");
+            assert_eq!(spec.repo, "seurat-wrappers");
+            assert_eq!(spec.r#ref, None);
+            assert_eq!(spec.subdir, None);
+        } else {
+            panic!("expected GitHub variant for bare owner/repo");
+        }
+    }
+
+    #[test]
+    fn test_bare_owner_repo_with_ref() {
+        let p = PackageSource::parse("immunogenomics/presto@master").unwrap();
+        if let PackageSource::GitHub(spec) = p {
+            assert_eq!(spec.owner, "immunogenomics");
+            assert_eq!(spec.repo, "presto");
+            assert_eq!(spec.r#ref, Some("master".to_string()));
         } else {
             panic!("expected GitHub variant");
         }

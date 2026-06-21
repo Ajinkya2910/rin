@@ -109,6 +109,35 @@ fn write_cached_ref(
     Ok(())
 }
 
+// --- GitHub auth helpers ----------------------------------------------------
+
+/// The GitHub token from the environment, or None if unset/empty.
+fn github_token() -> Option<String> {
+    std::env::var("GITHUB_TOKEN").ok().filter(|t| !t.is_empty())
+}
+
+/// Attach a Bearer token to a request, if one is provided.
+fn with_auth(req: reqwest::RequestBuilder, token: Option<&str>) -> reqwest::RequestBuilder {
+    match token {
+        Some(t) => req.header("Authorization", format!("Bearer {}", t)),
+        None => req,
+    }
+}
+
+/// Warn (at most once per run) that the configured token was rejected and we
+/// fell back to unauthenticated access.
+fn warn_token_rejected_once() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!(
+            "warning: GITHUB_TOKEN was rejected by GitHub (401) — retrying without it.\n\
+             Your token is likely expired or revoked. Public repos will still install,\n\
+             but unauthenticated access is limited to 60 requests/hour."
+        );
+    }
+}
+
 // --- GitHub API call --------------------------------------------------------
 
 async fn api_resolve_ref(
@@ -126,18 +155,28 @@ async fn api_resolve_ref(
         spec.owner, spec.repo, r#ref
     );
 
-    let mut req = client
-        .get(&url)
-        .header("User-Agent", "rv")
-        .header("Accept", "application/vnd.github+json");
+    let send = |token: Option<&str>| {
+        with_auth(
+            client
+                .get(&url)
+                .header("User-Agent", "rv")
+                .header("Accept", "application/vnd.github+json"),
+            token,
+        )
+        .send()
+    };
 
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        if !token.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", token));
-        }
+    let token = github_token();
+    let mut resp = send(token.as_deref()).await?;
+
+    // A 401 means a token was sent but GitHub rejected it (expired/revoked).
+    // For public repos, unauthenticated access still works — so drop the dead
+    // token and try once more before giving up.
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED && token.is_some() {
+        warn_token_rejected_once();
+        resp = send(None).await?;
     }
 
-    let resp = req.send().await?;
     let status = resp.status();
     let headers = resp.headers().clone();
 
@@ -273,14 +312,20 @@ pub async fn download_tarball(
         spec.owner, spec.repo, sha
     );
 
-    let mut req = client.get(&url).header("User-Agent", "rv");
-    if let Ok(token) = std::env::var("GITHUB_TOKEN") {
-        if !token.is_empty() {
-            req = req.header("Authorization", format!("Bearer {}", token));
-        }
+    let send = |token: Option<&str>| {
+        with_auth(client.get(&url).header("User-Agent", "rv"), token).send()
+    };
+
+    let token = github_token();
+    let mut resp = send(token.as_deref()).await?;
+
+    // Mirror api_resolve_ref: a rejected token (401) shouldn't block access to
+    // a public tarball — drop it and retry unauthenticated.
+    if resp.status() == reqwest::StatusCode::UNAUTHORIZED && token.is_some() {
+        warn_token_rejected_once();
+        resp = send(None).await?;
     }
 
-    let resp = req.send().await?;
     if !resp.status().is_success() {
         bail!(
             "codeload.github.com returned {} for {}/{}@{}",
@@ -409,6 +454,44 @@ pub fn extract_description(tarball_path: &Path, subdir: Option<&str>) -> Result<
     bail!("No DESCRIPTION found in tarball{}", suggestion);
 }
 
+/// Pull the NAMESPACE file out of a downloaded tarball, if present.
+///
+/// Mirrors `extract_description`'s path/depth logic. Returns Ok(None) when no
+/// NAMESPACE exists (it's optional) rather than erroring — only a genuinely
+/// unreadable archive is a hard error.
+pub fn extract_namespace(tarball_path: &Path, subdir: Option<&str>) -> Result<Option<String>> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(tarball_path)?;
+    let gz = flate2::read::GzDecoder::new(file);
+    let mut archive = tar::Archive::new(gz);
+
+    let target_suffix = match subdir {
+        Some(sub) => format!("/{}/NAMESPACE", sub.trim_matches('/')),
+        None => "/NAMESPACE".to_string(),
+    };
+    let expected_depth = match subdir {
+        Some(sub) => sub.split('/').filter(|s| !s.is_empty()).count() + 1,
+        None => 1,
+    };
+
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path_str = entry.path()?.to_string_lossy().into_owned();
+        if !path_str.ends_with(&target_suffix) {
+            continue;
+        }
+        let depth = path_str.split('/').count() - 1;
+        if depth != expected_depth {
+            continue;
+        }
+        let mut content = String::new();
+        entry.read_to_string(&mut content)?;
+        return Ok(Some(content));
+    }
+    Ok(None)
+}
+
 /// Find the package root inside an extracted tarball.
 ///
 /// GitHub tarballs unpack into a top-level directory whose name we
@@ -453,7 +536,43 @@ pub async fn fetch_metadata(
     let (tarball_path, sha256) = download_tarball(spec, &sha, cache_dir, client).await?;
     let description_text = extract_description(&tarball_path, spec.subdir.as_deref())?;
 
-    let parsed = crate::registry::parser::parse_description(&description_text)?;
+    let mut parsed = crate::registry::parser::parse_description(&description_text)?;
+
+    // Reconcile NAMESPACE against DESCRIPTION. Some packages import from a
+    // package in NAMESPACE but never declare it under Imports/Depends (e.g.
+    // SeuratWrappers does `importFrom(R.utils, gzip)` with no R.utils in
+    // Imports). R's lazy-loader follows NAMESPACE, so the install would crash.
+    // Fold any undeclared imports into `imports` so the resolver pulls them in.
+    if let Some(namespace_text) = extract_namespace(&tarball_path, spec.subdir.as_deref())? {
+        let declared: std::collections::HashSet<&str> = parsed
+            .depends
+            .iter()
+            .chain(parsed.imports.iter())
+            .map(|d| d.name.as_str())
+            .chain(parsed.linking_to.iter().map(|s| s.as_str()))
+            .collect();
+
+        let mut undeclared: Vec<String> = crate::registry::parser::parse_namespace_imports(
+            &namespace_text,
+        )
+        .into_iter()
+        .filter(|name| name != &parsed.name && !declared.contains(name.as_str()))
+        .collect();
+
+        if !undeclared.is_empty() {
+            eprintln!(
+                "  {} {}/{}: NAMESPACE imports undeclared in DESCRIPTION — \
+                 adding {}",
+                "ℹ", spec.owner, spec.repo, undeclared.join(", ")
+            );
+            for name in undeclared.drain(..) {
+                parsed.imports.push(Dependency {
+                    name,
+                    version_req: None,
+                });
+            }
+        }
+    }
 
     // GitHub packages MUST have a Version field. If they don't,
     // R CMD INSTALL would fail anyway — surface the clearer error here.

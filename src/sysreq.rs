@@ -427,8 +427,28 @@ pub fn detect_hdf5_problem(package_names: &[String]) -> Option<String> {
     let has_h5pcc = has_binary("h5pcc");
     let has_mpicc = has_binary("mpicc") || has_binary("mpicxx");
 
-    // Serial HDF5 available — all good.
+    // Serial HDF5 available — but is its *version* compatible? The CRAN hdf5r
+    // (1.3.x) only supports the HDF5 1.10–1.14 API. HDF5 2.x removed symbols it
+    // relies on (e.g. H5FD_family_init, plain H5Dread_chunk), so a too-new HDF5
+    // makes hdf5r fail — at compile time, or worse, only at load time when the
+    // build mixes new headers with an old/new lib. Homebrew ships HDF5 2.x by
+    // default, so this bites Mac users hard. Warn before the long compile.
     if has_h5cc {
+        if let Some((major, full)) = hdf5_version() {
+            if major >= 2 {
+                return Some(format!(
+                    "Active HDF5 is {} — too new for hdf5r (needs the 1.10–1.14 API).\n  \
+                     Building against HDF5 2.x fails (missing symbols like H5FD_family_init),\n  \
+                     or compiles but won't load ('symbol not found: _H5Dread_chunk').\n  \
+                     Fixes:\n    \
+                       macOS: brew install hdf5@1.10 && brew unlink hdf5 && \
+                     brew link --overwrite --force hdf5@1.10\n           \
+                       (relink hdf5 afterward so gdal/netcdf keep working)\n    \
+                       any OS: conda install -c conda-forge r-hdf5r  (precompiled, bundles HDF5)",
+                    full
+                ));
+            }
+        }
         return None;
     }
 
@@ -446,6 +466,47 @@ pub fn detect_hdf5_problem(package_names: &[String]) -> Option<String> {
     // No HDF5 binaries at all — install will fail with a clear error anyway.
     None
 }
+/// Probe the active HDF5 library version. Returns (major, full_version).
+///
+/// Uses `h5cc -showconfig` first (that's exactly what hdf5r's configure runs,
+/// so it reflects the version the build will actually use), falling back to
+/// `pkg-config --modversion hdf5`.
+fn hdf5_version() -> Option<(u32, String)> {
+    use std::process::Command;
+
+    // h5cc -showconfig prints a line like "    HDF5 Version: 2.1.1".
+    if let Ok(out) = Command::new("h5cc").arg("-showconfig").output() {
+        let text = String::from_utf8_lossy(&out.stdout);
+        for line in text.lines() {
+            if let Some(rest) = line.split("HDF5 Version:").nth(1) {
+                if let Some(v) = parse_major_version(rest.trim()) {
+                    return Some(v);
+                }
+            }
+        }
+    }
+
+    // Fallback: pkg-config reports just the version string, e.g. "2.1.1".
+    if let Ok(out) = Command::new("pkg-config")
+        .args(["--modversion", "hdf5"])
+        .output()
+    {
+        let text = String::from_utf8_lossy(&out.stdout);
+        if let Some(v) = parse_major_version(text.trim()) {
+            return Some(v);
+        }
+    }
+
+    None
+}
+
+/// Parse a version string like "2.1.1" into (major, "2.1.1").
+fn parse_major_version(s: &str) -> Option<(u32, String)> {
+    let v = s.trim();
+    let major = v.split('.').next()?.parse::<u32>().ok()?;
+    Some((major, v.to_string()))
+}
+
 /// Detect installed gcc version. Returns (major, full_version_string).
 /// Bug #14: gcc 15+ is too strict for many R packages (esp. older Bioc).
 pub fn detect_gcc_version() -> Option<(u32, String)> {

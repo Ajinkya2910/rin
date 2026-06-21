@@ -98,12 +98,17 @@ pub struct LockedPackage {
 ///   - PathBuf : Path :: String : &str
 ///
 /// We return PathBuf because we're creating a new path.
-pub fn write(resolved: &ResolvedDeps, roots: &[String]) -> Result<PathBuf> {
+pub fn write(
+    resolved: &ResolvedDeps,
+    roots: &[String],
+    r_version: &str,
+    bioc_version: &str,
+) -> Result<PathBuf> {
     let lockfile = Lockfile {
         metadata: LockfileMetadata {
             rv_version: env!("CARGO_PKG_VERSION").to_string(),
-            r_version: "4.4.0".to_string(),
-            bioc_version: "3.19".to_string(),
+            r_version: r_version.to_string(),
+            bioc_version: bioc_version.to_string(),
             generated_at: chrono_now(),
             roots: roots.to_vec(),
         },
@@ -234,7 +239,7 @@ mod tests {
         };
 
         // Write lockfile
-        let path = write(&resolved,&[]).unwrap();
+        let path = write(&resolved, &[], "4.4.1", "3.20").unwrap();
 
         // Read it back
         let lockfile = read(&path).unwrap();
@@ -243,6 +248,12 @@ mod tests {
         assert_eq!(lockfile.packages[0].name, "BiocGenerics");
         assert_eq!(lockfile.packages[1].name, "S4Vectors");
         assert_eq!(lockfile.packages[1].deps, vec!["BiocGenerics"]);
+
+        // Metadata must reflect the values passed in, not a hardcoded default —
+        // a stale bioc_version sends `rv install --retry` to the wrong
+        // Bioconductor release path and 404s every Bioc package.
+        assert_eq!(lockfile.metadata.r_version, "4.4.1");
+        assert_eq!(lockfile.metadata.bioc_version, "3.20");
 
         // Cleanup
         std::fs::remove_file(path).ok();
