@@ -2,18 +2,18 @@
 #
 # HOW THIS WORKS:
 # When you push a git tag like v0.1.0, this workflow runs on three machines
-# simultaneously — Linux, macOS ARM, macOS Intel. Each compiles rv into a
+# simultaneously — Linux, macOS ARM, macOS Intel. Each compiles rin into a
 # standalone binary, zips it, and uploads it to GitHub Releases.
 #
 # USAGE:
 #   git tag v0.1.0
 #   git push origin v0.1.0
 #
-# After ~10 minutes, check https://github.com/Ajinkya2910/rv/releases
+# After ~10 minutes, check https://github.com/Ajinkya2910/rin/releases
 # You'll see three downloadable files:
-#   rv-x86_64-unknown-linux-gnu.tar.gz    (Linux HPC)
-#   rv-aarch64-apple-darwin.tar.gz        (macOS ARM / Apple Silicon)
-#   rv-x86_64-apple-darwin.tar.gz         (macOS Intel)
+#   rin-x86_64-unknown-linux-gnu.tar.gz    (Linux HPC)
+#   rin-aarch64-apple-darwin.tar.gz        (macOS ARM / Apple Silicon)
+#   rin-x86_64-apple-darwin.tar.gz         (macOS Intel)
 
 name: Release
 
@@ -61,21 +61,21 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
-      # Step 3: Compile rv in release mode (optimized binary)
+      # Step 3: Compile rin in release mode (optimized binary)
       # --release turns on optimizations — the binary is ~5x smaller and faster
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
       # Step 4: Package the binary into a tarball
-      # The binary is at target/{target}/release/rv
+      # The binary is at target/{target}/release/rin
       - name: Package
         run: |
           cd target/${{ matrix.target }}/release
-          tar czf ../../../rv-${{ matrix.target }}.tar.gz rv
+          tar czf ../../../rin-${{ matrix.target }}.tar.gz rin
           cd ../../..
 
       # Step 5: Upload to GitHub Releases
       - name: Upload to Release
         uses: softprops/action-gh-release@v2
         with:
-          files: rv-${{ matrix.target }}.tar.gz
+          files: rin-${{ matrix.target }}.tar.gz

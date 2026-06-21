@@ -117,11 +117,11 @@ fn process_remotes<'a>(
 }
 
 /// Where we cache GitHub artifacts (refs and tarballs).
-/// Defaults to ~/.rv/cache; falls back to /tmp/rv-cache if home is unset.
+/// Defaults to ~/.rin/cache; falls back to /tmp/rin-cache if home is unset.
 fn github_cache_dir() -> anyhow::Result<PathBuf> {
     let base = match std::env::var("HOME") {
-        Ok(h) => PathBuf::from(h).join(".rv").join("cache"),
-        Err(_) => std::env::temp_dir().join("rv-cache"),
+        Ok(h) => PathBuf::from(h).join(".rin").join("cache"),
+        Err(_) => std::env::temp_dir().join("rin-cache"),
     };
     std::fs::create_dir_all(&base)?;
     Ok(base)
@@ -188,7 +188,7 @@ pub async fn resolve_with_constraints(
             "These aren't in CRAN, Bioconductor, your current R library, or any registered GitHub source.".dimmed()
         ));
         msg.push_str("If they're GitHub-hosted, install all of them together:\n  ");
-        msg.push_str("rv install ");
+        msg.push_str("rin install ");
         for m in &missing_deps {
             msg.push_str(&format!("gh:<owner>/{} ", m.name));
         }
@@ -408,8 +408,8 @@ fn collect_with_constraints(
             if let Some(ref ver_req) = dep.version_req {
                 if let Some(constraint) = VersionConstraint::parse(ver_req) {
                     let r_version = RVersion::parse(&registry.r_version);
-                    if let Some(ref rv) = r_version {
-                        if !constraint.satisfies(rv) {
+                    if let Some(ref rin) = r_version {
+                        if !constraint.satisfies(rin) {
                             anyhow::bail!(
                                 "Package '{}' requires R {}, but you have R {}",
                                 pkg_name, ver_req, registry.r_version
@@ -540,7 +540,7 @@ fn check_r_version(registry: &Registry, resolved: &[ResolvedPackage]) -> Result<
         for (pkg, reason) in &r_conflicts {
             msg.push_str(&format!("  {} — {}\n", pkg.red(), reason));
         }
-        msg.push_str("\nUpgrade R or use `rv use R@<version>` (coming soon)");
+        msg.push_str("\nUpgrade R or use `rin use R@<version>` (coming soon)");
         anyhow::bail!("{}", msg);
     }
 
@@ -613,7 +613,7 @@ fn verify_all_deps_resolved(
             {
                 anyhow::bail!(
                     "Resolver invariant violated: '{}' lists '{}' as a dependency \
-                     but '{}' was not resolved and is not installed. This is an rv \
+                     but '{}' was not resolved and is not installed. This is an rin \
                      bug — please report with the package spec you used.",
                     pkg.name, dep, dep
                 );

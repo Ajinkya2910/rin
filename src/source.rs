@@ -55,7 +55,7 @@ impl PackageSource {
             return Ok(PackageSource::GitHub(parse_github_spec(rest)?));
         }
         // Bare "owner/repo" form, as accepted by pak and remotes
-        // (e.g. `rv install satijalab/seurat-wrappers`). A CRAN/Bioconductor
+        // (e.g. `rin install satijalab/seurat-wrappers`). A CRAN/Bioconductor
         // package name can only contain letters, numbers, and dots — never a
         // slash — so any unprefixed spec containing '/' is unambiguously a
         // GitHub repository, not a registry name.

@@ -159,7 +159,7 @@ async fn api_resolve_ref(
         with_auth(
             client
                 .get(&url)
-                .header("User-Agent", "rv")
+                .header("User-Agent", "rin")
                 .header("Accept", "application/vnd.github+json"),
             token,
         )
@@ -313,7 +313,7 @@ pub async fn download_tarball(
     );
 
     let send = |token: Option<&str>| {
-        with_auth(client.get(&url).header("User-Agent", "rv"), token).send()
+        with_auth(client.get(&url).header("User-Agent", "rin"), token).send()
     };
 
     let token = github_token();
@@ -350,7 +350,7 @@ pub async fn download_tarball(
     let digest = hex::encode(Sha256::digest(&bytes));
 
     // Atomic write: tmp → rename. Avoids leaving a half-written file
-    // if rv is interrupted mid-download.
+    // if rin is interrupted mid-download.
     let tmp = tarball_path.with_extension("tar.gz.tmp");
     std::fs::File::create(&tmp)?.write_all(&bytes)?;
     std::fs::rename(&tmp, &tarball_path)?;
@@ -373,7 +373,7 @@ pub struct GitHubPackageMetadata {
     pub needs_compilation: bool,
     pub system_requirements: Option<String>,
 
-    // GitHub-specific provenance — for lockfile and rv why output.
+    // GitHub-specific provenance — for lockfile and rin why output.
     pub owner: String,
     pub repo: String,
     pub commit_sha: String,
@@ -579,7 +579,7 @@ pub async fn fetch_metadata(
     let version = parsed.version.ok_or_else(|| {
         anyhow!(
             "GitHub package {}/{} has no Version: field in DESCRIPTION.\n\
-             rv requires GitHub packages to have a valid version. \
+             rin requires GitHub packages to have a valid version. \
              File an issue at the upstream repo.",
             spec.owner, spec.repo
         )
@@ -613,7 +613,7 @@ mod tests {
     use super::*;
 
     fn test_cache_dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("rv-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("rin-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

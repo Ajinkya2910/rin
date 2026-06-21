@@ -12,11 +12,11 @@
 
 use clap::{Parser, Subcommand};
 
-/// rv — Fast R package manager for life sciences
+/// rin — Fast R package manager for life sciences
 ///
 /// This doc comment (///) becomes the --help text automatically!
 #[derive(Parser)]
-#[command(name = "rv")]
+#[command(name = "rin")]
 #[command(version)]
 #[command(about = "Fast R package manager for life sciences")]
 pub struct Cli {
@@ -38,7 +38,7 @@ pub struct Cli {
 pub enum Commands {
     /// Show the full dependency tree for packages
     ///
-    /// Example: rv resolve DESeq2 ggplot2
+    /// Example: rin resolve DESeq2 ggplot2
     Resolve {
         /// Package names to resolve
         #[arg(required = true)]
@@ -47,7 +47,7 @@ pub enum Commands {
 
     /// Check system dependencies before installing
     ///
-    /// Example: rv audit DESeq2
+    /// Example: rin audit DESeq2
     Audit {
         /// Package names to audit
         #[arg(required = true)]
@@ -56,8 +56,8 @@ pub enum Commands {
 
     /// Install packages (with pre-flight checks and parallel compilation)
     ///
-    /// Example: rv install DESeq2
-    /// Example: rv install --retry  (resume after fixing errors)
+    /// Example: rin install DESeq2
+    /// Example: rin install --retry  (resume after fixing errors)
     Install {
         /// Package names to install
         #[arg(required_unless_present = "retry")]
@@ -67,17 +67,17 @@ pub enum Commands {
         #[arg(long, default_value_t = false)]
         retry: bool,
         /// Skip the system-requirements pre-flight entirely.
-        /// Use when rv's sysreq map is wrong, or you've installed deps in a
-        /// non-standard path rv can't probe (HPC modules, conda envs, etc.).
+        /// Use when rin's sysreq map is wrong, or you've installed deps in a
+        /// non-standard path rin can't probe (HPC modules, conda envs, etc.).
         #[arg(long, default_value_t = false)]
         skip_sysreq: bool,
         /// Ignore a specific missing system library (repeatable).
         /// Use for fine-grained overrides instead of skipping all checks.
-        /// Example: rv install gert --ignore-missing libgit2-dev
+        /// Example: rin install gert --ignore-missing libgit2-dev
         #[arg(long, value_name = "LIB")]
         ignore_missing: Vec<String>,
         /// Strict pre-flight: block install when sysreqs appear missing.
-        /// Default is advisory — rv lists potentially-missing libs and
+        /// Default is advisory — rin lists potentially-missing libs and
         /// proceeds, letting the compiler surface real blockers. Use this
         /// flag to opt back into the old "prompt + abort before install"
         /// behavior (useful for CI, automated builds).
@@ -88,7 +88,7 @@ pub enum Commands {
 
     /// Explain why a package is in the dependency tree
     ///
-    /// Example: rv why rlang
+    /// Example: rin why rlang
     Why {
         /// Package name to trace
         #[arg(required = true)]
@@ -97,24 +97,24 @@ pub enum Commands {
 
     /// Generate a lockfile for reproducibility
     ///
-    /// Example: rv lock DESeq2 clusterProfiler EnhancedVolcano
+    /// Example: rin lock DESeq2 clusterProfiler EnhancedVolcano
     Lock {
         /// Package names to lock
         #[arg(required = true)]
         packages: Vec<String>,
     },
-    /// Restore packages from an rv.lock file
+    /// Restore packages from an rin.lock file
     ///
-    /// Example: rv restore
+    /// Example: rin restore
     Restore,
        /// Create and manage project-local R library
     ///
-    /// Example: rv venv
-    /// Example: rv venv my-project
-    /// Example: rv venv --r-version 4.4.0
+    /// Example: rin venv
+    /// Example: rin venv my-project
+    /// Example: rin venv --r-version 4.4.0
     Venv {
-        /// Name or path for the virtual environment (default: .rv)
-        #[arg(default_value = ".rv")]
+        /// Name or path for the virtual environment (default: .rin)
+        #[arg(default_value = ".rin")]
         path: String,
 
         /// R version to use (default: auto-detect)
@@ -127,8 +127,8 @@ pub enum Commands {
 
     /// Remove a virtual environment
     VenvRemove {
-        /// Path to the virtual environment to remove (default: .rv)
-        #[arg(default_value = ".rv")]
+        /// Path to the virtual environment to remove (default: .rin)
+        #[arg(default_value = ".rin")]
         path: String,
     },
 }

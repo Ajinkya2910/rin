@@ -3,17 +3,19 @@
 # It defines your project metadata, dependencies, and build settings.
 
 [package]
-name = "rv"                          # The binary name: users will type `rv resolve DESeq2`
+# The crate name on crates.io. The short name `rin` is held by an abandoned
+# 2016 crate, so we publish as `rin-cli` but ship the binary as `rin`.
+name = "rin-cli"
 version = "0.2.9"                    # Semantic versioning
 edition = "2021"                     # Rust edition (like Python 3.x vs 2.x)
 description = "Fast R package manager for life sciences"
 license = "MIT"
-repository = "https://github.com/Ajinkya2910/rv"
+repository = "https://github.com/Ajinkya2910/rin"
 
 # [[bin]] tells Cargo this project produces an executable binary, not a library.
-# When you run `cargo build`, it creates `target/debug/rv`
+# When you run `cargo build`, it creates `target/debug/rin` (users type `rin`).
 [[bin]]
-name = "rv"
+name = "rin"
 path = "src/main.rs"
 
 [dependencies]

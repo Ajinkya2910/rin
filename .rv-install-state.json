@@ -1,0 +1,22 @@
+{
+  "installed": [
+    "ggplot2",
+    "rlang",
+    "vctrs",
+    "isoband",
+    "glue",
+    "farver",
+    "withr",
+    "lifecycle",
+    "cli",
+    "viridisLite",
+    "S7",
+    "scales",
+    "RColorBrewer",
+    "labeling",
+    "gtable",
+    "R6",
+    "cpp11"
+  ],
+  "failed": []
+}

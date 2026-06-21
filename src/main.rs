@@ -1,4 +1,4 @@
-// src/main.rs — The entry point of the rv program.
+// src/main.rs — The entry point of the rin program.
 //
 // RUST CONCEPT: main() is where every Rust program starts, just like Python's
 // `if __name__ == "__main__"` or C's main(). The `#[tokio::main]` attribute
@@ -10,12 +10,12 @@
 //   - src/foo/mod.rs (directory module with sub-modules)
 // This is like Python's import system but more explicit.
 
-// Declare our modules — each is a major component of rv
+// Declare our modules — each is a major component of rin
 mod cli;        // Command-line argument parsing
 mod registry;   // Fetching package metadata from CRAN + Bioconductor
-mod resolver;   // Dependency resolution (the brain of rv)
+mod resolver;   // Dependency resolution (the brain of rin)
 mod sysreq;     // System dependency checking (apt packages)
-mod lockfile;   // rv.lock file generation and reading
+mod lockfile;   // rin.lock file generation and reading
 mod installer;  // Package installation orchestration
 mod version;
 mod sat_resolver;
@@ -45,22 +45,22 @@ async fn main() -> Result<()> {
     // This means you can never forget to handle a command.
     match cli.command {
         cli::Commands::Resolve { packages } => {
-            // `rv resolve DESeq2 ggplot2`
+            // `rin resolve DESeq2 ggplot2`
             cmd_resolve(&packages).await?;
         }
         cli::Commands::Audit { packages } => {
-            // `rv audit DESeq2`
+            // `rin audit DESeq2`
             cmd_audit(&packages).await?;
         }
         cli::Commands::Install { packages, retry, skip_sysreq, ignore_missing, strict_sysreq } => {
             cmd_install(&packages, retry, skip_sysreq, ignore_missing, strict_sysreq).await?;
         }
         cli::Commands::Why { package } => {
-            // `rv why rlang`
+            // `rin why rlang`
             cmd_why(&package).await?;
         }
         cli::Commands::Lock { packages } => {
-            // `rv lock DESeq2 clusterProfiler`
+            // `rin lock DESeq2 clusterProfiler`
             cmd_lock(&packages).await?;
         }
         cli::Commands::Restore => {
@@ -211,7 +211,7 @@ async fn cmd_audit(packages: &[String]) -> Result<()> {
         println!("  R looks in:      {}", fix.bad_paths.join(", "));
         println!("  gfortran is at:  {}", fix.correct_lib);
         println!(
-            "\n  {} rv can fix this by writing to {}",
+            "\n  {} rin can fix this by writing to {}",
             "→".blue(),
             fix.makevars_path.display()
         );
@@ -243,7 +243,7 @@ async fn cmd_install(
     }
     // Bug #50: auto-apply Makevars fix in install path (not just audit).
     // The fix exists in sysreq::check_makevars() but was only wired into
-    // `rv audit`. Users mostly skip audit and go straight to install, so
+    // `rin audit`. Users mostly skip audit and go straight to install, so
     // the Fortran-path mismatch bit them on install with a confusing error.
     // Run the same auto-fix at install start so RcppArmadillo / Matrix /
     // RcppEigen / fracdiff / SparseM / minqa work first try on macOS.
@@ -279,20 +279,20 @@ async fn cmd_install(
             } else {
                 println!("  Recommended: use the distro's gcc-12 / gcc-13 package.");
             }
-            println!("  If you hit confusing template errors, swap compilers and `rv install --retry`.\n");
+            println!("  If you hit confusing template errors, swap compilers and `rin install --retry`.\n");
         }
     }
 
     // Bug #55: on macOS without Homebrew, point users at the install command once.
     if std::env::consts::OS == "macos" && !sysreq::has_brew() {
         println!(
-            "{} Homebrew not detected. To enable rv's auto-install of system libraries:",
+            "{} Homebrew not detected. To enable rin's auto-install of system libraries:",
             "ℹ".blue()
         );
         println!(
             r#"  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)""#
         );
-        println!("  Then `rv install --retry`.\n");
+        println!("  Then `rin install --retry`.\n");
     }
 
     // Parse package specs — registry names pass through, GitHub specs
@@ -306,8 +306,8 @@ async fn cmd_install(
         let has_github = parsed
             .iter()
             .any(|p| matches!(p, source::PackageSource::GitHub(_)));
-        let venv_active = std::env::var("RV_VENV").is_ok()
-            || std::path::Path::new(".rv/lib").exists();
+        let venv_active = std::env::var("RIN_VENV").is_ok()
+            || std::path::Path::new(".rin/lib").exists();
         if has_github && !venv_active {
             println!(
                 "\n{} installing GitHub package outside a virtual environment.",
@@ -316,7 +316,7 @@ async fn cmd_install(
             println!(
                 "  GitHub packages may shadow CRAN versions in your system library."
             );
-            println!("  Consider running `rv venv` first.\n");
+            println!("  Consider running `rin venv` first.\n");
         }
     }
 
@@ -325,9 +325,9 @@ async fn cmd_install(
 
    
 
-    // Merge incremental installs into existing rv.lock instead of clobbering.
+    // Merge incremental installs into existing rin.lock instead of clobbering.
 let mut all_roots: Vec<String> = packages.to_vec();
-if let Ok(existing) = lockfile::read("rv.lock") {
+if let Ok(existing) = lockfile::read("rin.lock") {
     let prior_roots: Vec<String> = if existing.metadata.roots.is_empty() {
         // Old-format lockfile — fall back to using all packages as roots
         // so we don't silently lose them on incremental install.
@@ -343,7 +343,7 @@ if let Ok(existing) = lockfile::read("rv.lock") {
     }
     if all_roots.len() > before {
         println!(
-            "  {} merging with {} prior root(s) from rv.lock",
+            "  {} merging with {} prior root(s) from rin.lock",
             "↻".blue(),
             all_roots.len() - before
         );
@@ -359,9 +359,9 @@ let root_names = sat_resolver::prepare_github_packages(&mut registry, &parsed).a
 
 let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names).await?;
 
-    // write rv.lock immediately after resolve succeeds, so:
-    //   - `rv why` works mid-failure (it reads rv.lock)
-    //   - `rv install --retry` has a lockfile to read
+    // write rin.lock immediately after resolve succeeds, so:
+    //   - `rin why` works mid-failure (it reads rin.lock)
+    //   - `rin install --retry` has a lockfile to read
     //   - The lockfile reflects intent, not just successful completion
     let lockfile_path = lockfile::write(
         &resolved,
@@ -429,14 +429,14 @@ let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names
                 // Bug #41 default: advisory pre-flight, not gatekeeping.
                 //
                 // The compiler is the source of truth — if a package builds,
-                // the sysreq was satisfied (regardless of how rv detected it).
+                // the sysreq was satisfied (regardless of how rin detected it).
                 // RSPM frequently over-reports (pandoc as a runtime-only dep,
-                // libX11 for optional clipboard features, etc.); rv shouldn't
+                // libX11 for optional clipboard features, etc.); rin shouldn't
                 // second-guess the compiler with false-positive blocks.
                 //
                 // Real blockers will surface as compile errors with actionable
                 // messages; user fixes those (module load / conda / Makevars)
-                // and `rv install --retry` resumes from where it stopped.
+                // and `rin install --retry` resumes from where it stopped.
                 println!(
                     "\n{} {} potentially missing system librar{} (advisory):",
                     "ℹ".blue(),
@@ -527,7 +527,7 @@ let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names
                 );
             }
             println!(
-                "  rv couldn't map these automatically; check they're installed \
+                "  rin couldn't map these automatically; check they're installed \
                  (e.g. via module/conda/brew), or re-run with {} to silence this.",
                 "--skip-sysreq".bold()
             );
@@ -552,8 +552,8 @@ async fn cmd_why(package: &str) -> Result<()> {
     use colored::Colorize;
 
     // Read the lockfile — the source of truth for what's resolved.
-    let lockfile = lockfile::read("rv.lock").context(
-        "rv why needs an rv.lock. Run `rv lock <packages>` first.",
+    let lockfile = lockfile::read("rin.lock").context(
+        "rin why needs an rin.lock. Run `rin lock <packages>` first.",
     )?;
 
     // Index packages by name for fast lookup.
@@ -686,13 +686,13 @@ async fn cmd_lock(packages: &[String]) -> Result<()> {
 
     Ok(())
 }
-/// Restore packages from rv.lock
+/// Restore packages from rin.lock
 async fn cmd_restore() -> Result<()> {
     use colored::Colorize;
 
     // Read the lockfile
-    println!("{}", "Reading rv.lock...".dimmed());
-    let lockfile = lockfile::read("rv.lock")?;
+    println!("{}", "Reading rin.lock...".dimmed());
+    let lockfile = lockfile::read("rin.lock")?;
 
     println!(
         "  Found {} packages for R {} / Bioconductor {}",
@@ -711,8 +711,8 @@ async fn cmd_restore() -> Result<()> {
         println!("{}", "Verifying GitHub package integrity...".dimmed());
 
         let cache_dir = match std::env::var("HOME") {
-            Ok(h) => std::path::PathBuf::from(h).join(".rv").join("cache"),
-            Err(_) => std::env::temp_dir().join("rv-cache"),
+            Ok(h) => std::path::PathBuf::from(h).join(".rin").join("cache"),
+            Err(_) => std::env::temp_dir().join("rin-cache"),
         };
         std::fs::create_dir_all(&cache_dir)?;
         let client = reqwest::Client::new();
@@ -841,7 +841,7 @@ async fn cmd_restore() -> Result<()> {
     installer::install(&resolved, &lockfile.metadata.bioc_version).await?;
 
     println!(
-        "\n{} Environment restored from rv.lock ({} packages)",
+        "\n{} Environment restored from rin.lock ({} packages)",
         "✓".green(),
         resolved.packages.len()
     );
@@ -874,7 +874,7 @@ async fn cmd_venv_create(path: &str, r_version: Option<String>) -> Result<()> {
                     String::from_utf8_lossy(&out.stdout).trim().to_string()
                 }
                 _ => {
-                    anyhow::bail!("R not found. Specify R version manually: rv venv --r-version 4.4.0");
+                    anyhow::bail!("R not found. Specify R version manually: rin venv --r-version 4.4.0");
                 }
             }
         }
@@ -885,7 +885,7 @@ async fn cmd_venv_create(path: &str, r_version: Option<String>) -> Result<()> {
 
     // Write config file
     let config = format!(
-        "# rv virtual environment\n\
+        "# rin virtual environment\n\
          r_version = \"{}\"\n\
          created = \"{}\"\n",
         r_ver,
@@ -899,32 +899,32 @@ async fn cmd_venv_create(path: &str, r_version: Option<String>) -> Result<()> {
 
     let activate_content = format!(
         r#"#!/bin/sh
-# rv virtual environment activation script
+# rin virtual environment activation script
 # Usage: source {path}/activate
 
 # Save old values for deactivate
-export _RV_OLD_R_LIBS_USER="${{R_LIBS_USER:-}}"
-export _RV_OLD_PS1="${{PS1:-}}"
+export _RIN_OLD_R_LIBS_USER="${{R_LIBS_USER:-}}"
+export _RIN_OLD_PS1="${{PS1:-}}"
 
 # Set the library path
 export R_LIBS_USER="{lib}"
-export RV_VENV="{venv}"
+export RIN_VENV="{venv}"
 
 # Update prompt to show active environment
-export PS1="(rv:{name}) $PS1"
+export PS1="(rin:{name}) $PS1"
 
 # Define deactivate function
 deactivate() {{
-    export R_LIBS_USER="$_RV_OLD_R_LIBS_USER"
-    export PS1="$_RV_OLD_PS1"
-    unset RV_VENV
-    unset _RV_OLD_R_LIBS_USER
-    unset _RV_OLD_PS1
+    export R_LIBS_USER="$_RIN_OLD_R_LIBS_USER"
+    export PS1="$_RIN_OLD_PS1"
+    unset RIN_VENV
+    unset _RIN_OLD_R_LIBS_USER
+    unset _RIN_OLD_PS1
     unset -f deactivate
-    echo "rv environment deactivated"
+    echo "rin environment deactivated"
 }}
 
-echo "rv environment active (R {r_ver})"
+echo "rin environment active (R {r_ver})"
 echo "  Library: {lib}"
 echo "  Deactivate: deactivate"
 "#,
@@ -958,7 +958,7 @@ echo "  Deactivate: deactivate"
 fn cmd_venv_info() -> Result<()> {
     use colored::Colorize;
 
-    match std::env::var("RV_VENV") {
+    match std::env::var("RIN_VENV") {
         Ok(path) => {
             let lib_path = std::path::PathBuf::from(&path);
             let count = std::fs::read_dir(&lib_path)
@@ -970,13 +970,13 @@ fn cmd_venv_info() -> Result<()> {
             println!("  Deactivate: deactivate");
         }
         Err(_) => {
-            // Check if .rv exists but isn't activated
-            if std::path::Path::new(".rv/lib").exists() {
+            // Check if .rin exists but isn't activated
+            if std::path::Path::new(".rin/lib").exists() {
                 println!("{} Virtual environment exists but is not activated", "!".yellow());
-                println!("  Run: source .rv/activate");
+                println!("  Run: source .rin/activate");
             } else {
                 println!("{} No virtual environment found", "✗".red());
-                println!("  Run: rv venv");
+                println!("  Run: rin venv");
             }
         }
     }
@@ -1020,7 +1020,7 @@ fn handle_missing_sysreqs(
             "\n{} HPC environment detected (Lmod/Modules).",
             "ℹ".blue()
         );
-        println!("  rv can't install system libraries on a cluster (no sudo).");
+        println!("  rin can't install system libraries on a cluster (no sudo).");
         println!("  Resolve through the module system:");
         for dep in &report.missing {
                 println!("  module spider {}", sysreq::module_hint(&dep.name));
@@ -1040,7 +1040,7 @@ fn handle_missing_sysreqs(
             "s" | "skip" => {
                 println!(
                     "{} trusting loaded modules.\n  \
-                     Tip: pass {} next time: rv install {} --skip-sysreq",
+                     Tip: pass {} next time: rin install {} --skip-sysreq",
                     "⚠".yellow(),
                     "--skip-sysreq".bold(),
                     install_cmd_tail

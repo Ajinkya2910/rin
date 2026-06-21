@@ -1,8 +1,8 @@
-# rv
+# rin
 
 **A fast, reliable R package manager for life sciences.**
 
-rv is to R what [uv](https://github.com/astral-sh/uv) is to Python — a fast standalone package manager that handles dependency resolution, installation, and reproducible environments as one tool, without needing the language runtime installed to bootstrap. For R that means: a single binary that resolves, audits, and installs CRAN + Bioconductor packages with parallel compilation, lockfiles, and project-isolated environments — built with correctness on real-world bioinformatics setups as the non-negotiable baseline.
+rin is to R what [uv](https://github.com/astral-sh/uv) is to Python — a fast standalone package manager that handles dependency resolution, installation, and reproducible environments as one tool, without needing the language runtime installed to bootstrap. For R that means: a single binary that resolves, audits, and installs CRAN + Bioconductor packages with parallel compilation, lockfiles, and project-isolated environments — built with correctness on real-world bioinformatics setups as the non-negotiable baseline.
 
 Built in Rust. First-class Bioconductor support. No background R process. No system R assumptions. No surprises halfway through a 56-package compile.
 
@@ -16,11 +16,11 @@ Try installing DESeq2 on a fresh conda-R environment on an HPC cluster — the s
 |---|---|---|
 | `BiocManager::install("DESeq2")` | ❌ **DESeq2 not installed.** Cascade failure across 6 packages starting from `zlib.h: No such file or directory` in XVector. | 10m 01s (failed) |
 | `pak::pkg_install("bioc::DESeq2")` | ❌ Same cascade failure. Same cryptic compiler error. Same broken end state. | (failed) |
-| **`rv install DESeq2`** | ✅ **56 packages installed, first try.** Pre-flight audit identified system dependencies before any compilation started. | **6m 02s** |
+| **`rin install DESeq2`** | ✅ **56 packages installed, first try.** Pre-flight audit identified system dependencies before any compilation started. | **6m 02s** |
 
 Both BiocManager and pak delegate compilation to R's build system, which silently assumes the user has already sorted out system dependencies. When they haven't, the install crashes mid-compile with a C-level error, and every downstream package falls apart. The user is left debugging compiler output across six failures to find the one real issue.
 
-rv runs a pre-flight audit *before* it writes a single byte: does the compiler exist, does `pkg-config` find the library, is the Fortran path sane? If anything's off, rv tells you up front — in language a bioinformatician can act on, not a linker error.
+rin runs a pre-flight audit *before* it writes a single byte: does the compiler exist, does `pkg-config` find the library, is the Fortran path sane? If anything's off, rin tells you up front — in language a bioinformatician can act on, not a linker error.
 
 **That's the thesis.** Speed is a bonus. Reliability is the product.
 
@@ -28,68 +28,68 @@ rv runs a pre-flight audit *before* it writes a single byte: does the compiler e
 
 ## Quick start
 
-**Install rv** (one line, no Rust toolchain needed):
+**Install rin** (one line, no Rust toolchain needed):
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/Ajinkya2910/rv/main/install.sh | sh
-export PATH="$HOME/.rv/bin:$PATH"
+curl -sSf https://raw.githubusercontent.com/Ajinkya2910/rin/main/install.sh | sh
+export PATH="$HOME/.rin/bin:$PATH"
 ```
 
 **Install DESeq2 into an isolated environment:**
 
 ```bash
-rv venv myproject
+rin venv myproject
 source myproject/activate
-rv install DESeq2
+rin install DESeq2
 ```
 
 Done. No sudo, no conda, no `BiocManager::install` incantations, no manual system-lib hunting.
 
 **The full command surface, at a glance:**
 
-`rv resolve` · `rv audit` · `rv install` · `rv lock` · `rv restore` · `rv why` · `rv venv`
+`rin resolve` · `rin audit` · `rin install` · `rin lock` · `rin restore` · `rin why` · `rin venv`
 
 (Detailed reference [below](#commands).)
 
 ---
 
-## What rv does differently
+## What rin does differently
 
 ### 1. Constraint-aware dependency resolution
 
 BiocManager doesn't validate version constraints across the transitive dependency tree. When packages have conflicting requirements (`Depends: Matrix (>= 1.5)` in one place, `Depends: Matrix (< 1.4)` in another), you get the latest of each — and the conflict only surfaces later, often at package load time with a cryptic error.
 
-rv parses every version constraint (`>=`, `>`, `<=`, `<`, `==`) across `Depends`, `Imports`, and `LinkingTo`, then validates the full tree. When a constraint can't be satisfied, rv tells you exactly which package wants what, and falls back to CRAN Archive to find a satisfying older version if needed.
+rin parses every version constraint (`>=`, `>`, `<=`, `<`, `==`) across `Depends`, `Imports`, and `LinkingTo`, then validates the full tree. When a constraint can't be satisfied, rin tells you exactly which package wants what, and falls back to CRAN Archive to find a satisfying older version if needed.
 
 ### 2. First-class Bioconductor support
 
-Bioconductor isn't an afterthought. rv fetches software, annotation, and experiment repositories at the correct version for your R version. Bioconductor packages get priority over CRAN when a name exists in both (e.g. `Matrix` → CRAN, but `GenomeInfoDbData` → Bioconductor annotation).
+Bioconductor isn't an afterthought. rin fetches software, annotation, and experiment repositories at the correct version for your R version. Bioconductor packages get priority over CRAN when a name exists in both (e.g. `Matrix` → CRAN, but `GenomeInfoDbData` → Bioconductor annotation).
 
 ### 3. Pre-flight system audit
 
-Before compiling anything, rv checks for required system libraries using **capability-based detection** (`pkg-config`, `which`) rather than package-manager heuristics. This matters because:
+Before compiling anything, rin checks for required system libraries using **capability-based detection** (`pkg-config`, `which`) rather than package-manager heuristics. This matters because:
 
 - On HPC, libraries come from `module load`, not `apt` or `rpm`
 - On Mac, some tools come from Xcode, not Homebrew
 - On a dev machine, someone may have built openssl from source
 
-The question rv asks isn't "is the package installed" — it's "can R find this library when it needs to?" That's what actually determines whether the build succeeds.
+The question rin asks isn't "is the package installed" — it's "can R find this library when it needs to?" That's what actually determines whether the build succeeds.
 
 ### 4. Deterministic lockfiles
 
 ```bash
-rv lock       # writes rv.lock with pinned versions
-rv restore    # reproduces the exact environment elsewhere
+rin lock       # writes rin.lock with pinned versions
+rin restore    # reproduces the exact environment elsewhere
 ```
 
-BiocManager has no equivalent. renv exists but needs R to bootstrap. rv's lockfile is plain TOML, generated by the Rust binary, readable by anything.
+BiocManager has no equivalent. renv exists but needs R to bootstrap. rin's lockfile is plain TOML, generated by the Rust binary, readable by anything.
 
 ### 5. Isolated virtual environments
 
-Like Python's `venv`, rv venvs give each project its own R library:
+Like Python's `venv`, rin venvs give each project its own R library:
 
 ```bash
-rv venv analysis-2026
+rin venv analysis-2026
 source analysis-2026/activate
 ```
 
@@ -97,11 +97,11 @@ source analysis-2026/activate
 
 ### 6. Parallel compilation with tier-aware scheduling
 
-rv computes the dependency DAG, groups packages into tiers (packages in tier N only depend on tiers < N), and compiles each tier in parallel using [rayon](https://github.com/rayon-rs/rayon). No background R process, no Rscript subprocess overhead — just parallel `R CMD INSTALL`.
+rin computes the dependency DAG, groups packages into tiers (packages in tier N only depend on tiers < N), and compiles each tier in parallel using [rayon](https://github.com/rayon-rs/rayon). No background R process, no Rscript subprocess overhead — just parallel `R CMD INSTALL`.
 
 ### 7. Standalone binary, no Rust required
 
-rv ships as a single statically-linked binary (musl on Linux, native on macOS). No `R`-based bootstrap, no runtime Python or Node dependencies, no shared library version mismatches. It just runs.
+rin ships as a single statically-linked binary (musl on Linux, native on macOS). No `R`-based bootstrap, no runtime Python or Node dependencies, no shared library version mismatches. It just runs.
 
 ---
 
@@ -113,7 +113,7 @@ All numbers below are from a real run on a GWU HPC login node (Rocky Linux, x86_
 
 | Tool | Environment | Outcome | Time |
 |---|---|---|---|
-| **rv** | Fresh `rv venv` | ✅ 56 packages installed, first try | **6m 02s** |
+| **rin** | Fresh `rin venv` | ✅ 56 packages installed, first try | **6m 02s** |
 | BiocManager | Fresh conda-R env | ❌ 6 cascade failures — DESeq2 not installed | 10m 01s |
 | pak | Fresh conda-R env (no zlib) | ❌ Same zlib cascade failure | — |
 
@@ -125,11 +125,11 @@ All numbers below are from a real run on a GWU HPC login node (Rocky Linux, x86_
 
 > **Read this before drawing conclusions from the numbers.**
 >
-> When pak has PPM binaries available, it skips compilation entirely and finishes in 2m 47s. rv compiles all 56 packages from source in 6m 02s. **This isn't a resolver comparison — it's cached binaries vs. source compilation.** Comparing them on speed alone is comparing apples to oranges.
+> When pak has PPM binaries available, it skips compilation entirely and finishes in 2m 47s. rin compiles all 56 packages from source in 6m 02s. **This isn't a resolver comparison — it's cached binaries vs. source compilation.** Comparing them on speed alone is comparing apples to oranges.
 >
-> When PPM doesn't cover your platform — macOS conda-R, non-mainstream Linux distros, aarch64, air-gapped HPC, custom toolchains — pak falls back to source compilation and hits the same cascade failures as BiocManager. rv's pre-flight audit handles the source-build path reliably across all of those environments today.
+> When PPM doesn't cover your platform — macOS conda-R, non-mainstream Linux distros, aarch64, air-gapped HPC, custom toolchains — pak falls back to source compilation and hits the same cascade failures as BiocManager. rin's pre-flight audit handles the source-build path reliably across all of those environments today.
 >
-> rv will match pak's binary-cache speed when [Phase 2 infrastructure](#roadmap) ships (Hetzner build farm + Cloudflare R2 storage, Bioconductor-first, HPC-targeted). Until then, rv's value is **always-reliable source builds**, not raw speed.
+> rin will match pak's binary-cache speed when [Phase 2 infrastructure](#roadmap) ships (Hetzner build farm + Cloudflare R2 storage, Bioconductor-first, HPC-targeted). Until then, rin's value is **always-reliable source builds**, not raw speed.
 
 ### BiocManager cascade: root cause
 
@@ -142,13 +142,13 @@ io_utils.c:16:10: fatal error: zlib.h: No such file or directory
 compilation terminated.
 ```
 
-One missing header. 6 packages fail. No pre-flight check to catch it. This is exactly the class of problem rv is built to eliminate.
+One missing header. 6 packages fail. No pre-flight check to catch it. This is exactly the class of problem rin is built to eliminate.
 
 ---
 
-## How rv compares
+## How rin compares
 
-| | rv | BiocManager | pak | renv |
+| | rin | BiocManager | pak | renv |
 |---|---|---|---|---|
 | Standalone binary | ✅ | ❌ needs R | ❌ needs R | ❌ needs R |
 | Bioconductor first-class | ✅ | ✅ | ⚠️ via prefix | ❌ |
@@ -168,14 +168,14 @@ One missing header. 6 packages fail. No pre-flight check to catch it. This is ex
 ### One-line install (recommended)
 
 ```bash
-curl -sSf https://raw.githubusercontent.com/Ajinkya2910/rv/main/install.sh | sh
+curl -sSf https://raw.githubusercontent.com/Ajinkya2910/rin/main/install.sh | sh
 ```
 
-This downloads a statically-linked binary to `~/.rv/bin/rv`. Add it to your PATH:
+This downloads a statically-linked binary to `~/.rin/bin/rin`. Add it to your PATH:
 
 ```bash
-export PATH="$HOME/.rv/bin:$PATH"   # one-time, current shell
-echo 'export PATH="$HOME/.rv/bin:$PATH"' >> ~/.bashrc   # persistent
+export PATH="$HOME/.rin/bin:$PATH"   # one-time, current shell
+echo 'export PATH="$HOME/.rin/bin:$PATH"' >> ~/.bashrc   # persistent
 ```
 
 ### Supported platforms
@@ -191,8 +191,8 @@ echo 'export PATH="$HOME/.rv/bin:$PATH"' >> ~/.bashrc   # persistent
 ### Build from source
 
 ```bash
-git clone https://github.com/Ajinkya2910/rv
-cd rv
+git clone https://github.com/Ajinkya2910/rin
+cd rin
 cargo build --release
 ```
 
@@ -203,14 +203,14 @@ Requires Rust 1.70+.
 ## Commands
 
 ```bash
-rv resolve <pkg>           # show the full dependency tree without installing
-rv audit                   # check system deps against resolved tree
-rv install <pkg>...        # resolve, audit, download, compile, install
-rv lock                    # write rv.lock with pinned versions
-rv restore                 # reproduce environment from rv.lock
-rv why <pkg>               # trace why a package is in the tree
-rv venv [name]             # create a project-isolated R library
-rv venv-info               # show the active venv
+rin resolve <pkg>           # show the full dependency tree without installing
+rin audit                   # check system deps against resolved tree
+rin install <pkg>...        # resolve, audit, download, compile, install
+rin lock                    # write rin.lock with pinned versions
+rin restore                 # reproduce environment from rin.lock
+rin why <pkg>               # trace why a package is in the tree
+rin venv [name]             # create a project-isolated R library
+rin venv-info               # show the active venv
 ```
 
 ---
@@ -219,13 +219,13 @@ rv venv-info               # show the active venv
 
 Because credibility matters more than marketing:
 
-- **No binary cache today.** rv compiles everything from source. Phase 2 (planned) adds Bioconductor + CRAN binary infrastructure.
+- **No binary cache today.** rin compiles everything from source. Phase 2 (planned) adds Bioconductor + CRAN binary infrastructure.
 - **Linux and macOS only.** Windows support is on the roadmap but not trivial due to Rtools and different sysreq tooling.
 - **Not every edge case of CRAN's PACKAGES format is handled.** The resolver works on the DESeq2 / Seurat-scale dependency trees (tested with 55- and 142-package installs); rarer metadata quirks may surface.
-- **System dependency mappings are curated.** If your package needs a system lib rv doesn't know about, compilation will fail with R's native error (not rv's friendly one). PRs adding to `SYSREQ_MAP` are welcome.
+- **System dependency mappings are curated.** If your package needs a system lib rin doesn't know about, compilation will fail with R's native error (not rin's friendly one). PRs adding to `SYSREQ_MAP` are welcome.
 - **Parallel compilation occasionally races.** Some packages fail with "lazy loading failed" in heavy parallel tiers — this is a known issue and the roadmap includes automatic retry.
 
-If any of those blockers hit you, file an issue. rv is production-used at small scale today; corner cases surface with wider adoption.
+If any of those blockers hit you, file an issue. rin is production-used at small scale today; corner cases surface with wider adoption.
 
 ---
 
@@ -236,7 +236,7 @@ If any of those blockers hit you, file an issue. rv is production-used at small 
 - Cross-platform sysreq audit (Debian/Ubuntu, RHEL/Rocky/Fedora, macOS)
 - Parallel tier-based compilation
 - Virtual environments with activate/deactivate
-- TOML lockfiles with `rv lock` / `rv restore`
+- TOML lockfiles with `rin lock` / `rin restore`
 - CRAN Archive fallback for older versions
 - One-line installer
 
@@ -252,33 +252,33 @@ If any of those blockers hit you, file an issue. rv is production-used at small 
 - Integration with HPC module systems (auto-suggest `module load`)
 
 ### Nice-to-haves
-- `rv use R@4.5.0` — manage R versions directly, like rustup for R
+- `rin use R@4.5.0` — manage R versions directly, like rustup for R
 - Multi-progress UI (per-package status, like uv)
-- `rv compare` — dependency footprint comparison across packages
+- `rin compare` — dependency footprint comparison across packages
 
 ---
 
 ## Why Rust
 
-Bioinformaticians don't care what rv is written in. But the language choice enables things pak and BiocManager can't do:
+Bioinformaticians don't care what rin is written in. But the language choice enables things pak and BiocManager can't do:
 
-- **Statically-linked standalone binary.** No "install R first, then install BiocManager, then..." — rv runs on a login node with zero bootstrap.
+- **Statically-linked standalone binary.** No "install R first, then install BiocManager, then..." — rin runs on a login node with zero bootstrap.
 - **True parallelism via rayon.** pak uses parallel R subprocesses, which is much heavier than rayon's work-stealing scheduler.
-- **Fast resolver.** rv loads 26,000+ package metadata records and resolves DESeq2's full tree in under a second.
+- **Fast resolver.** rin loads 26,000+ package metadata records and resolves DESeq2's full tree in under a second.
 - **Fewer parser bugs.** Rust's type system eliminates a whole class of memory and concurrency bugs at compile time — useful when the codebase is parsing metadata from two registries, walking dependency graphs, and orchestrating dozens of parallel compilations.
 
 ---
 
 ## Credits
 
-rv draws heavily on:
+rin draws heavily on:
 
 - [uv](https://github.com/astral-sh/uv) — for proving the "Rust-based package manager built for correctness" model works at scale
 - [pak](https://pak.r-lib.org/) — for years of excellent work on R dependency resolution, and for the Posit Public Package Manager that sets the bar for binary caching
 - [renv](https://rstudio.github.io/renv/) — for establishing project-local library conventions in R
 - [r-system-requirements](https://github.com/rstudio/r-system-requirements) — the reference database for R → system library mappings
 
-rv tries to take the best ideas from each, package them into a single standalone binary, and make Bioconductor + HPC the first-class use case instead of an afterthought.
+rin tries to take the best ideas from each, package them into a single standalone binary, and make Bioconductor + HPC the first-class use case instead of an afterthought.
 
 ---
 
@@ -288,7 +288,7 @@ MIT. See [LICENSE](LICENSE).
 
 ## Contributing
 
-Issues and PRs welcome. Especially: adding to `SYSREQ_MAP`, expanding the test matrix to more Bioconductor packages, and reporting environments where rv misbehaves.
+Issues and PRs welcome. Especially: adding to `SYSREQ_MAP`, expanding the test matrix to more Bioconductor packages, and reporting environments where rin misbehaves.
 
 ---
 

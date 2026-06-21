@@ -31,7 +31,7 @@ pub struct SysreqReport {
 
 }
 
-/// A compiled package rv couldn't map, plus the cleaned `SystemRequirements:`
+/// A compiled package rin couldn't map, plus the cleaned `SystemRequirements:`
 /// tokens from its DESCRIPTION. `libs` is the single source of truth: it both
 /// gates whether the package is flagged (empty → not uncertain) and is what the
 /// advisory displays. See `normalize_sysreq`.
@@ -123,6 +123,7 @@ const SYSREQ_MAP: &[(&str, &[&str])] = &[
     ("RMySQL", &["libmariadb-dev"]),
     ("RPostgres", &["libpq-dev"]),
     ("odbc", &["unixodbc-dev"]),
+    ("rJava", &["default-jdk"]),
 
     // Compilation essentials
     ("Rcpp", &["build-essential"]),
@@ -290,7 +291,115 @@ const MODULE_HINT_MAP: &[(&str, &str)] = &[
     ("unixodbc-dev",         "unixODBC"),
     ("build-essential",      "gcc"),
     ("gfortran",             "gcc"),
+    ("default-jdk",          "java"),
 ];
+
+/// Debian canonical name → conda-forge package name (Bug #28).
+/// Used to suggest a `conda install -c conda-forge <name>` remediation when a
+/// build fails for lack of a system library. Conda is the most reliable route
+/// on HPC where a module may be missing or have a broken dependency chain.
+/// Generic fallback (no entry) reuses the `module_hint` stripping rule, since
+/// conda-forge names usually match the stripped Debian name.
+const CONDA_MAP: &[(&str, &str)] = &[
+    ("libcurl4-openssl-dev", "curl"),
+    ("libssl-dev",           "openssl"),
+    ("libxml2-dev",          "libxml2"),
+    ("libhdf5-dev",          "hdf5"),
+    ("libgsl-dev",           "gsl"),
+    ("libgit2-dev",          "libgit2"),
+    ("libsodium-dev",        "libsodium"),
+    ("libfontconfig1-dev",   "fontconfig"),
+    ("libharfbuzz-dev",      "harfbuzz"),
+    ("libfribidi-dev",       "fribidi"),
+    ("libfreetype6-dev",     "freetype"),
+    ("libpng-dev",           "libpng"),
+    ("libtiff5-dev",         "libtiff"),
+    ("libcairo2-dev",        "cairo"),
+    ("libpq-dev",            "libpq"),
+    ("libmariadb-dev",       "mariadb-connector-c"),
+    ("libgdal-dev",          "gdal"),
+    ("libgeos-dev",          "geos"),
+    ("libproj-dev",          "proj"),
+    ("libbz2-dev",           "bzip2"),
+    ("liblzma-dev",          "xz"),
+    ("libmagick++-dev",      "imagemagick"),
+    ("libavfilter-dev",      "ffmpeg"),
+    ("unixodbc-dev",         "unixodbc"),
+    ("jags",                 "jags"),
+    ("cmake",                "cmake"),
+    ("build-essential",      "gxx"),
+    ("gfortran",             "gfortran"),
+    ("default-jdk",          "openjdk"),
+];
+
+/// Translate a Debian-canonical sysreq name to the most likely conda-forge name.
+pub fn conda_hint(debian_name: &str) -> String {
+    if let Some(hint) = CONDA_MAP
+        .iter()
+        .find(|(d, _)| *d == debian_name)
+        .map(|(_, c)| *c)
+    {
+        return hint.to_string();
+    }
+    // Same stripping fallback as module_hint: conda-forge names usually match.
+    let mut s = debian_name;
+    if let Some(stripped) = s.strip_prefix("lib") {
+        s = stripped;
+    }
+    if let Some(stripped) = s.strip_suffix("-dev") {
+        s = stripped;
+    } else if let Some(stripped) = s.strip_suffix("-devel") {
+        s = stripped;
+    }
+    s.to_string()
+}
+
+/// Build a remediation hint for a package that failed to compile, listing the
+/// system libraries it needs and how to provide them via *both* an HPC module
+/// system and conda. Shown regardless of whether conda is active, since the
+/// user may prefer either route. Returns None when we have no offline mapping
+/// for this package (so the caller leaves the message untouched).
+pub fn sysreq_hints(pkg_name: &str) -> Option<String> {
+    let libs = SYSREQ_MAP
+        .iter()
+        .find(|(n, _)| *n == pkg_name)
+        .map(|(_, l)| *l)?;
+
+    // De-duplicate while preserving order: sf needs gdal/geos/proj, but a
+    // package could map two Debian names to the same module/conda name.
+    let mut modules: Vec<String> = Vec::new();
+    let mut condas: Vec<String> = Vec::new();
+    for lib in libs {
+        let m = module_hint(lib);
+        if !modules.contains(&m) {
+            modules.push(m);
+        }
+        let c = conda_hint(lib);
+        if !condas.contains(&c) {
+            condas.push(c);
+        }
+    }
+
+    let noun = if libs.len() == 1 { "dependency" } else { "dependencies" };
+    let mut out = format!(
+        "  Likely missing system {}: {}\n  Provide it via either:\n",
+        noun,
+        libs.join(", ")
+    );
+    out.push_str(&format!(
+        "    • HPC modules: module spider {}\n                   then: module load <name/version> for each\n",
+        modules.join(" ")
+    ));
+    out.push_str(&format!(
+        "    • conda:       conda install -c conda-forge {}",
+        condas.join(" ")
+    ));
+    // rJava additionally needs R re-pointed at the JDK after the lib is present.
+    if pkg_name == "rJava" {
+        out.push_str("\n  Then register the JDK with R (no root needed): R CMD javareconf -e");
+    }
+    Some(out)
+}
 
 /// Translate a Debian-canonical sysreq name to the most likely HPC module name.
 pub fn module_hint(debian_name: &str) -> String {
@@ -1161,7 +1270,7 @@ pub fn fix_makevars(fix: &MakevarsFix) -> Result<()> {
     std::fs::create_dir_all(r_dir)?;
 
     let makevars_content = format!(
-        "# Added by rv — fixes gfortran path for Homebrew\n\
+        "# Added by rin — fixes gfortran path for Homebrew\n\
          FC = {}\n\
          FLIBS = -L{} -lgfortran -lquadmath\n",
         fix.gfortran_path, fix.correct_lib
@@ -1183,7 +1292,7 @@ pub fn fix_makevars(fix: &MakevarsFix) -> Result<()> {
 // RSPM sysreqs lookup (Bug #3)
 //
 // Layered design:
-//   1. On-disk cache  (~/.cache/rv/sysreqs/{distro}-{release}.json) — survives runs
+//   1. On-disk cache  (~/.cache/rin/sysreqs/{distro}-{release}.json) — survives runs
 //   2. RSPM HTTP API  (3s timeout; cache write on success)
 //   3. SYSREQ_MAP     (fallback; also the only source for Bioc/GitHub/macOS)
 //
@@ -1210,7 +1319,7 @@ mod rspm {
     fn cache_path(distro: &str, release: &str) -> Option<PathBuf> {
         let home = std::env::var("HOME").ok()?;
         Some(PathBuf::from(home)
-            .join(".cache/rv/sysreqs")
+            .join(".cache/rin/sysreqs")
             .join(format!("{}-{}.json", distro, release)))
     }
 
@@ -1285,11 +1394,50 @@ mod rspm {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_sysreq;
+    use super::{conda_hint, normalize_sysreq, sysreq_hints};
 
     #[test]
     fn none_yields_empty() {
         assert!(normalize_sysreq(None).is_empty());
+    }
+
+    #[test]
+    fn hint_none_for_unmapped_package() {
+        // A pure-R package with no system deps gets no hint block.
+        assert!(sysreq_hints("jsonlite").is_none());
+    }
+
+    #[test]
+    fn hint_lists_both_module_and_conda() {
+        let h = sysreq_hints("sf").expect("sf has sysreqs");
+        // Multi-lib package: all three system libs named.
+        assert!(h.contains("libgdal-dev"));
+        assert!(h.contains("dependencies:")); // plural noun
+        // Module route uses HPC-friendly names.
+        assert!(h.contains("module spider gdal geos proj"));
+        // Conda route always shown regardless of environment.
+        assert!(h.contains("conda install -c conda-forge gdal geos proj"));
+    }
+
+    #[test]
+    fn hint_rjava_includes_javareconf() {
+        let h = sysreq_hints("rJava").expect("rJava has sysreqs");
+        assert!(h.contains("module spider java"));
+        assert!(h.contains("conda install -c conda-forge openjdk"));
+        assert!(h.contains("R CMD javareconf -e"));
+    }
+
+    #[test]
+    fn hint_single_dep_uses_singular_noun() {
+        let h = sysreq_hints("magick").expect("magick has sysreqs");
+        assert!(h.contains("dependency:")); // singular
+        assert!(h.contains("conda install -c conda-forge imagemagick"));
+    }
+
+    #[test]
+    fn conda_hint_falls_back_to_stripping() {
+        // Unmapped name: strip lib/-dev like module_hint does.
+        assert_eq!(conda_hint("libfoo-dev"), "foo");
     }
 
     #[test]

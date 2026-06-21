@@ -1,21 +1,21 @@
 #!/bin/sh
-# install.sh — One-line installer for rv
+# install.sh — One-line installer for rin
 #
 # Usage:
-#   curl -sSf https://raw.githubusercontent.com/Ajinkya2910/rv/main/install.sh | sh
+#   curl -sSf https://raw.githubusercontent.com/Ajinkya2910/rin/main/install.sh | sh
 #
 # What this does:
 #   1. Detects your OS (Linux or macOS) and CPU (x86_64 or ARM)
-#   2. Downloads the correct pre-built rv binary from GitHub Releases
-#   3. Installs it to ~/.rv/bin/rv
+#   2. Downloads the correct pre-built rin binary from GitHub Releases
+#   3. Installs it to ~/.rin/bin/rin
 #   4. Tells you how to add it to your PATH
 #
 # No root/sudo required. No Rust installation needed.
 
 set -e
 
-REPO="Ajinkya2910/rv"
-INSTALL_DIR="$HOME/.rv/bin"
+REPO="Ajinkya2910/rin"
+INSTALL_DIR="$HOME/.rin/bin"
 
 # --- Detect platform ---
 
@@ -46,34 +46,34 @@ echo "Detected platform: $TARGET"
 
 # --- Find latest release ---
 
-LATEST_URL="https://github.com/$REPO/releases/latest/download/rv-$TARGET.tar.gz"
+LATEST_URL="https://github.com/$REPO/releases/latest/download/rin-$TARGET.tar.gz"
 
-echo "Downloading rv from $LATEST_URL..."
+echo "Downloading rin from $LATEST_URL..."
 
 # --- Download and install ---
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-curl -sL "$LATEST_URL" -o "$TMP_DIR/rv.tar.gz"
+curl -sL "$LATEST_URL" -o "$TMP_DIR/rin.tar.gz"
 
 # Verify we got a real file, not a 404 HTML page
-FILE_SIZE=$(wc -c < "$TMP_DIR/rv.tar.gz" | tr -d ' ')
+FILE_SIZE=$(wc -c < "$TMP_DIR/rin.tar.gz" | tr -d ' ')
 if [ "$FILE_SIZE" -lt 1000 ]; then
     echo "Error: Download failed. No release found for $TARGET."
     echo "Check https://github.com/$REPO/releases for available binaries."
     exit 1
 fi
 
-tar xzf "$TMP_DIR/rv.tar.gz" -C "$TMP_DIR"
+tar xzf "$TMP_DIR/rin.tar.gz" -C "$TMP_DIR"
 
 # Create install directory and copy binary
 mkdir -p "$INSTALL_DIR"
-mv "$TMP_DIR/rv" "$INSTALL_DIR/rv"
-chmod +x "$INSTALL_DIR/rv"
+mv "$TMP_DIR/rin" "$INSTALL_DIR/rin"
+chmod +x "$INSTALL_DIR/rin"
 
 echo ""
-echo "✓ rv installed to $INSTALL_DIR/rv"
+echo "✓ rin installed to $INSTALL_DIR/rin"
 
 # --- Check if already in PATH ---
 
@@ -82,11 +82,11 @@ case ":$PATH:" in
         echo "✓ $INSTALL_DIR is already in your PATH"
         echo ""
         echo "Try it:"
-        echo "  rv resolve DESeq2"
+        echo "  rin resolve DESeq2"
         ;;
     *)
         echo ""
-        echo "Add rv to your PATH by adding this line to your shell config:"
+        echo "Add rin to your PATH by adding this line to your shell config:"
         echo ""
         # Detect shell config file
         SHELL_NAME="$(basename "$SHELL")"
@@ -95,12 +95,12 @@ case ":$PATH:" in
             bash) CONFIG_FILE="~/.bashrc" ;;
             *)    CONFIG_FILE="your shell config" ;;
         esac
-        echo "  echo 'export PATH=\"\$HOME/.rv/bin:\$PATH\"' >> $CONFIG_FILE"
+        echo "  echo 'export PATH=\"\$HOME/.rin/bin:\$PATH\"' >> $CONFIG_FILE"
         echo ""
         echo "Then restart your shell or run:"
-        echo "  export PATH=\"\$HOME/.rv/bin:\$PATH\""
+        echo "  export PATH=\"\$HOME/.rin/bin:\$PATH\""
         echo ""
         echo "Try it:"
-        echo "  rv resolve DESeq2"
+        echo "  rin resolve DESeq2"
         ;;
 esac

@@ -1,8 +1,8 @@
 /target
-target/debug/rv
-target/debug/rv.d
+target/debug/rin
+target/debug/rin.d
 
 my-project/
-rv.lock
-.rv-install-state.json
-.rv-pbtest/
+rin.lock
+.rin-install-state.json
+.rin-pbtest/

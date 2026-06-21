@@ -1,0 +1,29 @@
+#!/bin/sh
+# rin virtual environment activation script
+# Usage: source .rin/activate
+
+# Save old values for deactivate
+export _RIN_OLD_R_LIBS_USER="${R_LIBS_USER:-}"
+export _RIN_OLD_PS1="${PS1:-}"
+
+# Set the library path
+export R_LIBS_USER="/Users/apatil/Documents/rin/.rin/lib"
+export RIN_VENV="/Users/apatil/Documents/rin/.rin"
+
+# Update prompt to show active environment
+export PS1="(rin:.rin) $PS1"
+
+# Define deactivate function
+deactivate() {
+    export R_LIBS_USER="$_RIN_OLD_R_LIBS_USER"
+    export PS1="$_RIN_OLD_PS1"
+    unset RIN_VENV
+    unset _RIN_OLD_R_LIBS_USER
+    unset _RIN_OLD_PS1
+    unset -f deactivate
+    echo "rin environment deactivated"
+}
+
+echo "rin environment active (R 4.4.1)"
+echo "  Library: /Users/apatil/Documents/rin/.rin/lib"
+echo "  Deactivate: deactivate"

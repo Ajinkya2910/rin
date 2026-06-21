@@ -27,7 +27,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use rayon::prelude::*;
 
 /// State file path for tracking install progress (for --retry)
-const STATE_FILE: &str = ".rv-install-state.json";
+const STATE_FILE: &str = ".rin-install-state.json";
 
 /// Whether to build packages with conda stripped from the environment.
 /// Decided once at the start of `install()` (see `decide_conda_exclusion`),
@@ -46,17 +46,17 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> 
 
     // Bug #46: ensure we have a writable install target before doing anything.
     // On HPC, R's default library is often the shared module install (read-only).
-    // If so, auto-create .rv/lib so the install lands somewhere the user owns.
+    // If so, auto-create .rin/lib so the install lands somewhere the user owns.
     let auto_created = ensure_writable_library()?;
     if auto_created {
         println!(
             "  {} System R library is read-only — created {} for this project.",
             "ℹ".blue(),
-            ".rv/lib".bold()
+            ".rin/lib".bold()
         );
         println!(
             "    {} for a fully-configured environment with an activate script.",
-            "Run `rv venv` instead".dimmed()
+            "Run `rin venv` instead".dimmed()
         );
     }
 
@@ -84,11 +84,33 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> 
     let mut installed: HashSet<String> = HashSet::new();
     let mut failed: Vec<(String, String)> = Vec::new(); // (name, error)
     let mut retry_queue: HashSet<String> = HashSet::new();
-    // Find packages already installed on this system
+    // Find packages already installed on this system. These are part of the
+    // resolved closure but need no work — collapse them into one summary line
+    // instead of one line each, so the packages we're *actually* installing
+    // aren't buried. (Pass -v / RIN_VERBOSE to list them.)
     let already_installed = check_installed_versions(&resolved.packages);
+    let already_count = already_installed.len();
     for name in &already_installed {
-        println!("  {} {} (already installed)", "✓".green(), name.dimmed());
         installed.insert(name.clone());
+    }
+    // `to_install` scopes the progress counter to real work, not the whole
+    // dependency graph, so a single new package reads (1/1), not (48/48).
+    let to_install = total - already_count;
+    let verbose = std::env::var("RIN_VERBOSE").is_ok();
+    println!(
+        "  {} Resolved {} package(s) · {}",
+        "✓".green(),
+        total,
+        if to_install == 0 {
+            "all up to date".dimmed().to_string()
+        } else {
+            format!("{} already installed", already_count).dimmed().to_string()
+        }
+    );
+    if verbose {
+        for name in &already_installed {
+            println!("    {} {} (already installed)", "·".dimmed(), name.dimmed());
+        }
     }
 
     // Install in tiers
@@ -120,7 +142,7 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> 
         }
 
         println!(
-            "\n  {} Installing tier: {} packages in parallel",
+            "\n  {} Installing {} package(s) in parallel",
             "→".blue(),
             ready.len()
         );
@@ -132,14 +154,14 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> 
         // compiled on a separate thread. Rayon handles the thread pool.
         //
         // We collect results into a Vec of (name, Result) tuples.
-        let pb = ProgressBar::new(total as u64);
+        let pb = ProgressBar::new(to_install as u64);
         pb.set_style(
             ProgressStyle::default_bar()
                 .template("  [{bar:30.green/dim}] {pos}/{len} {msg}")
                 .unwrap()
                 .progress_chars("█░░"),
         );
-        pb.set_position(installed.len() as u64);
+        pb.set_position((installed.len() - already_count) as u64);
 
         let results: Vec<(String, Result<()>)> = ready
             .par_iter()
@@ -170,7 +192,8 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> 
                         "  {} {} {}",
                         "✓".green(),
                         name,
-                        format!("({}/{})", installed.len() + 1, total).dimmed()
+                        format!("({}/{})", installed.len() + 1 - already_count, to_install)
+                            .dimmed()
                     );
                     installed.insert(name);
                 }
@@ -233,11 +256,24 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> 
 
         println!(
             "\n{}",
-            "Fix the issues above, then run: rv install --retry".bold()
+            "Fix the issues above, then run: rin install --retry".bold()
         );
 
         // Return error so the process exits with non-zero status
         anyhow::bail!("{} packages failed to install", failed.len());
+    }
+
+    // Success summary: lead with what changed, not the closure size.
+    let new_count = installed.len() - already_count;
+    if new_count == 0 {
+        println!("\n  {} Everything up to date.", "✓".green());
+    } else {
+        println!(
+            "\n  {} Done. {} installed, {} up to date.",
+            "✓".green(),
+            new_count,
+            already_count
+        );
     }
 
     Ok(())
@@ -252,7 +288,7 @@ fn install_single_package(pkg: &ResolvedPackage, bioc_version: &str) -> Result<(
 
     // ── CRAN / Bioconductor path ──────────────────────────────────────────
 
-    let download_dir = PathBuf::from("/tmp/rv-downloads");
+    let download_dir = PathBuf::from("/tmp/rin-downloads");
     std::fs::create_dir_all(&download_dir)?;
 
     let tarball_path = download_dir.join(format!("{}_{}.tar.gz", pkg.name, pkg.version));
@@ -411,7 +447,7 @@ fn sha256_file(path: &PathBuf) -> Result<String> {
 
 /// Install a GitHub-sourced package from its already-downloaded tarball.
 ///
-/// Day 2 cached the tarball at ~/.rv/cache/github/{owner}/{repo}/{sha}.tar.gz.
+/// Day 2 cached the tarball at ~/.rin/cache/github/{owner}/{repo}/{sha}.tar.gz.
 /// We extract it to a unique temp dir, locate the package root, and run
 /// R CMD INSTALL pointing at the directory (not the tarball).
 ///
@@ -430,7 +466,7 @@ fn install_from_github_tarball(
 
     // The resolver normally populates this during the resolve phase. But the
     // cache can be evicted between resolve and install (manual cleanup, a TMP
-    // sweep, a separate `rv` run). Rather than dead-end the user with "try
+    // sweep, a separate `rin` run). Rather than dead-end the user with "try
     // re-running", re-fetch the exact pinned SHA on demand and verify it against
     // the lockfile's recorded hash.
     if !tarball_path.exists() {
@@ -439,7 +475,7 @@ fn install_from_github_tarball(
 
     // Unique temp dir per (owner, repo, full-sha) — no collision risk.
     let tmp_extract = std::env::temp_dir().join(format!(
-        "rv-gh-{}-{}-{}",
+        "rin-gh-{}-{}-{}",
         gh.owner, gh.repo, gh.commit_sha
     ));
 
@@ -545,8 +581,8 @@ fn extract_tarball(tarball: &PathBuf, dest: &PathBuf) -> Result<()> {
 /// Where Day 2 wrote the GitHub cache. Mirrors prepare_github_packages.
 fn github_cache_dir() -> Result<PathBuf> {
     let base = match std::env::var("HOME") {
-        Ok(h) => PathBuf::from(h).join(".rv").join("cache"),
-        Err(_) => std::env::temp_dir().join("rv-cache"),
+        Ok(h) => PathBuf::from(h).join(".rin").join("cache"),
+        Err(_) => std::env::temp_dir().join("rin-cache"),
     };
     std::fs::create_dir_all(&base)?;
     Ok(base)
@@ -580,14 +616,14 @@ fn explain_symbol_mismatch(pkg_name: &str, chunk: &str) -> String {
         Some("HDF5") => msg.push_str(&format!(
             "\n  HDF5: Homebrew ships 2.x, but hdf5r needs the 1.10–1.14 API. Rebuild against 1.x:\n    \
                brew install hdf5@1.10 && brew unlink hdf5 && brew link --overwrite --force hdf5@1.10\n    \
-               rm -rf \"$(R RHOME)\"/../{0} ; rv install {0}\n    \
+               rm -rf \"$(R RHOME)\"/../{0} ; rin install {0}\n    \
                (afterward: brew unlink hdf5@1.10 && brew link hdf5  — keeps gdal/netcdf working)\n  \
              Or sidestep entirely: conda install -c conda-forge r-hdf5r",
             rebuild
         )),
         Some(other) => msg.push_str(&format!(
             "\n  Ensure only one version of {} is active (check: otool -L / ldd on the .so), \
-             then rebuild {}: rv install {}",
+             then rebuild {}: rin install {}",
             other, rebuild, rebuild
         )),
         None => msg.push_str(
@@ -710,7 +746,7 @@ fn run_r_cmd_install(target: &PathBuf, pkg_name: &str) -> Result<()> {
         // Persist the full stderr for debugging — friendly_error below
         // is a one-line summary; users need the real output too.
         let log_path = std::path::PathBuf::from(format!(
-            "/tmp/rv-fail-{}.log",
+            "/tmp/rin-fail-{}.log",
             pkg_name
         ));
         let _ = std::fs::write(&log_path, combined.as_bytes());
@@ -743,7 +779,10 @@ fn parse_compile_error(stderr: &str, pkg_name: &str) -> String {
             .nth(1)
             .unwrap_or(header)
             .trim();
-        return format!("Missing header: {}\n  A system library is probably not installed.", header_name);
+        return with_sysreq_hint(
+            format!("Missing header: {}\n  A system library is probably not installed.", header_name),
+            pkg_name,
+        );
     }
 
     // C++ standard mismatch
@@ -756,7 +795,7 @@ fn parse_compile_error(stderr: &str, pkg_name: &str) -> String {
     {
         return "C++ standard mismatch: package needs a newer C++ standard than R is using.\n  \
                 Fix: echo 'CXX_STD = CXX17' >> ~/.R/Makevars\n  \
-                Then: rv install --retry".to_string();
+                Then: rin install --retry".to_string();
     }
 
     // Missing Fortran compiler
@@ -775,7 +814,7 @@ fn parse_compile_error(stderr: &str, pkg_name: &str) -> String {
         let missing = line.split('\'').nth(1);
         return match missing {
             Some(pkg) => format!(
-                "Missing R dependency: {}\n  Fix: rv install {} first, then retry",
+                "Missing R dependency: {}\n  Fix: rin install {} first, then retry",
                 pkg, pkg
             ),
             None => format!(
@@ -835,7 +874,7 @@ fn parse_compile_error(stderr: &str, pkg_name: &str) -> String {
 
     // Permission denied
     if stderr.contains("Permission denied") || stderr.contains("cannot create directory") {
-        return "Permission denied when writing to library.\n  Fix: use rv venv to create a project-local library, or check directory permissions.".to_string();
+        return "Permission denied when writing to library.\n  Fix: use rin venv to create a project-local library, or check directory permissions.".to_string();
     }
 
     // Disk space
@@ -846,7 +885,7 @@ fn parse_compile_error(stderr: &str, pkg_name: &str) -> String {
     if stderr.contains("library 'gfortran' not found") 
         || stderr.contains("/opt/gfortran/lib") 
     {
-        return "Fortran library path mismatch — R is looking for gfortran in the wrong location.\n  Fix: update ~/.R/Makevars with the correct gfortran path.\n  Run rv audit for details.".to_string();
+        return "Fortran library path mismatch — R is looking for gfortran in the wrong location.\n  Fix: update ~/.R/Makevars with the correct gfortran path.\n  Run rin audit for details.".to_string();
     }
 
     // Linker errors (missing system library at link time)
@@ -854,7 +893,10 @@ fn parse_compile_error(stderr: &str, pkg_name: &str) -> String {
         || stderr.contains("symbol(s) not found")
         || stderr.contains("ld: library not found") 
     {
-        return "Linker error — a system library is missing or not found by the linker.\n  Fix: run rv audit to check system dependencies.".to_string();
+        return with_sysreq_hint(
+            "Linker error — a system library is missing or not found by the linker.\n  Fix: run rin audit to check system dependencies.".to_string(),
+            pkg_name,
+        );
     }
 
    
@@ -866,35 +908,49 @@ fn parse_compile_error(stderr: &str, pkg_name: &str) -> String {
         .find(|l| l.contains("error:") || l.contains("ERROR"))
         .unwrap_or("Unknown compilation error");
 
-    format!("Compilation error: {}", last_error.trim())
+    // A bare "configuration failed" / generic compile error is the most common
+    // shape for a missing system library that didn't trip the header/linker
+    // patterns above (e.g. rJava's configure aborting). Attach a remediation
+    // hint when we know what this package needs.
+    with_sysreq_hint(format!("Compilation error: {}", last_error.trim()), pkg_name)
+}
+
+/// Append module/conda remediation hints to a failure message when `rin` has an
+/// offline sysreq mapping for the package. No-op (returns `msg` unchanged) for
+/// packages with no known system dependencies — pure-R build failures stay terse.
+fn with_sysreq_hint(msg: String, pkg_name: &str) -> String {
+    match crate::sysreq::sysreq_hints(pkg_name) {
+        Some(hint) => format!("{}\n{}", msg, hint),
+        None => msg,
+    }
 }
 
 /// Get the active venv library path, if any
 fn get_venv_lib() -> Option<std::path::PathBuf> {
     // First check if venv is activated via environment variable
-    if let Ok(path) = std::env::var("RV_VENV") {
+    if let Ok(path) = std::env::var("RIN_VENV") {
         let lib_path = std::path::PathBuf::from(path).join("lib");
         if lib_path.exists() {
             return Some(lib_path);
         }
     }
-    // Fallback: check if .rv/lib exists in current directory
-    let local = std::path::PathBuf::from(".rv/lib");
+    // Fallback: check if .rin/lib exists in current directory
+    let local = std::path::PathBuf::from(".rin/lib");
     if local.exists() {
         return Some(std::fs::canonicalize(&local).unwrap_or(local));
     }
     None
 }
 
-/// Bug #46: ensure rv has a writable library before any install starts.
+/// Bug #46: ensure rin has a writable library before any install starts.
 ///
 /// Decision tree:
-///   1. A venv is already active (RV_VENV set, or .rv/lib exists in CWD)
+///   1. A venv is already active (RIN_VENV set, or .rin/lib exists in CWD)
 ///      → use it, no change. (get_venv_lib already handles this.)
 ///   2. R's default library is writable
 ///      → use it (preserves normal Linux/Mac dev experience).
 ///   3. R's default library is read-only (typical HPC: shared module install)
-///      → auto-create .rv/lib in the current directory. get_venv_lib() will
+///      → auto-create .rin/lib in the current directory. get_venv_lib() will
 ///        pick this up on every subsequent call, so the rest of the install
 ///        pipeline needs no changes.
 ///
@@ -921,7 +977,7 @@ fn ensure_writable_library() -> Result<bool> {
     // This is more portable than checking Unix permissions and handles
     // edge cases like read-only mounts and quota-exhausted directories.
     if let Some(ref default_lib) = r_default {
-        let probe = default_lib.join(".rv-write-test");
+        let probe = default_lib.join(".rin-write-test");
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -935,10 +991,10 @@ fn ensure_writable_library() -> Result<bool> {
     }
 
     // Case 3: system library is read-only (or R is unavailable).
-    // Auto-create .rv/lib. get_venv_lib() will see it on the next call.
-    let auto_lib = PathBuf::from(".rv/lib");
+    // Auto-create .rin/lib. get_venv_lib() will see it on the next call.
+    let auto_lib = PathBuf::from(".rin/lib");
     std::fs::create_dir_all(&auto_lib)
-        .context("Failed to create .rv/lib for fallback install location")?;
+        .context("Failed to create .rin/lib for fallback install location")?;
 
     Ok(true)
 }
@@ -1079,7 +1135,7 @@ fn r_binary_under(prefix: &str) -> bool {
 ///
 /// Bug #28 enabling: the resolver uses this to recognize packages that
 /// are installed on disk but not in any registry — e.g. a GitHub-only
-/// package installed via a prior `rv install` invocation.
+/// package installed via a prior `rin install` invocation.
 pub fn list_installed_packages() -> std::collections::HashSet<String> {
     use std::collections::HashSet;
 
@@ -1190,7 +1246,7 @@ pub fn check_installed_versions(packages: &[ResolvedPackage]) -> Vec<String> {
 /// Resume a previously failed installation
 /// Resume a previously failed installation.
 ///
-/// Strategy: reconstruct the resolved tree from rv.lock, then hand it to
+/// Strategy: reconstruct the resolved tree from rin.lock, then hand it to
 /// `install()`. The installer's existing `check_installed_versions()` skip
 /// logic handles "already done" packages automatically — so the retry
 /// naturally targets failed + unattempted packages without custom filtering.
@@ -1203,8 +1259,8 @@ pub async fn retry_install() -> Result<()> {
     // State file is informational only — installer rebuilds it on success.
     let state = load_install_state().ok();
 
-    let lockfile = crate::lockfile::read("rv.lock").context(
-        "retry needs rv.lock. Run `rv install <packages>` to generate one first.",
+    let lockfile = crate::lockfile::read("rin.lock").context(
+        "retry needs rin.lock. Run `rin install <packages>` to generate one first.",
     )?;
 
     // Convert locked entries back into ResolvedPackages. Mirrors the same
@@ -1288,7 +1344,7 @@ fn save_install_state(
 
 fn load_install_state() -> Result<InstallState> {
     let content = std::fs::read_to_string(STATE_FILE)
-        .context("No install state found. Run `rv install` first.")?;
+        .context("No install state found. Run `rin install` first.")?;
 
     let state: InstallState = serde_json::from_str(&content)?;
     Ok(state)
@@ -1302,8 +1358,8 @@ mod tests {
     fn symbol_mismatch_identifies_hdf5_and_culprit() {
         // The exact failure shape from SeuratDisk loading a bad hdf5r.so.
         let chunk = "unable to load shared object \
-            '/Users/x/.rv/lib/hdf5r/libs/hdf5r.so': \
-            dlopen(/Users/x/.rv/lib/hdf5r/libs/hdf5r.so, 0x0006): \
+            '/Users/x/.rin/lib/hdf5r/libs/hdf5r.so': \
+            dlopen(/Users/x/.rin/lib/hdf5r/libs/hdf5r.so, 0x0006): \
             symbol not found in flat namespace '_H5Dread_chunk'";
         let msg = explain_symbol_mismatch("SeuratDisk", chunk);
         assert!(msg.contains("version mismatch"));

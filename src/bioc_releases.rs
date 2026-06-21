@@ -81,7 +81,7 @@ fn parse_version(v: &str) -> (u32, u32) {
 /// Disk cache location. Lives alongside the GitHub tarball cache.
 fn cache_path() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
-    let dir = PathBuf::from(home).join(".rv").join("cache");
+    let dir = PathBuf::from(home).join(".rin").join("cache");
     std::fs::create_dir_all(&dir)?;
     Ok(dir.join("bioc_releases.toml"))
 }
