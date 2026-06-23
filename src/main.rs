@@ -149,9 +149,50 @@ async fn cmd_resolve(packages: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Apply the macOS Fortran/Makevars fix if R's FLIBS points at a stale
+/// gfortran path. Idempotent and a no-op off macOS or when nothing's wrong —
+/// safe to call from every code path that precedes a compile. Centralized so
+/// `audit`, the install pre-flight, the post-sysreq pass, and `--retry` all
+/// behave identically.
+fn maybe_fix_makevars() -> Result<()> {
+    use colored::Colorize;
+    if let Some(fix) = sysreq::check_makevars() {
+        println!("{} R's Fortran paths are misconfigured:", "⚠".yellow());
+        println!("  R looks in:      {}", fix.bad_paths.join(", "));
+        println!("  gfortran is at:  {}", fix.correct_lib);
+        println!(
+            "  {} writing fix to {}",
+            "→".blue(),
+            fix.makevars_path.display()
+        );
+        sysreq::fix_makevars(&fix)?;
+        println!("  {} Makevars updated.\n", "✓".green());
+    }
+    Ok(())
+}
+
 /// Audit system dependencies before installing
 async fn cmd_audit(packages: &[String]) -> Result<()> {
     use colored::Colorize;
+
+    // Bare `rin audit` (no packages) audits the current environment: fall back
+    // to the roots recorded in rin.lock. This is what users reach for after a
+    // failed install — and it's exactly what rin's own error hints suggest
+    // ("Run rin audit for details"), so it must work without arguments.
+    let packages: Vec<String> = if packages.is_empty() {
+        match lockfile::read("rin.lock") {
+            Ok(lock) if !lock.metadata.roots.is_empty() => lock.metadata.roots.clone(),
+            Ok(lock) => lock.packages.iter().map(|p| p.name.clone()).collect(),
+            Err(_) => {
+                anyhow::bail!(
+                    "no packages given and no rin.lock found.\n  \
+                     Run `rin audit <packages>` or `rin audit` from a directory with an rin.lock."
+                );
+            }
+        }
+    } else {
+        packages.to_vec()
+    };
 
     let parsed: Vec<source::PackageSource> = packages
         .iter()
@@ -202,23 +243,8 @@ async fn cmd_audit(packages: &[String]) -> Result<()> {
             );
         }
     }
-// Offer to fix Makevars if needed
-    if let Some(fix) = sysreq::check_makevars() {
-        println!(
-            "\n{} R's Fortran paths are misconfigured:",
-            "⚠".yellow()
-        );
-        println!("  R looks in:      {}", fix.bad_paths.join(", "));
-        println!("  gfortran is at:  {}", fix.correct_lib);
-        println!(
-            "\n  {} rin can fix this by writing to {}",
-            "→".blue(),
-            fix.makevars_path.display()
-        );
-        // Auto-fix for now; later you can add --fix flag
-        sysreq::fix_makevars(&fix)?;
-        println!("  {} Makevars updated!", "✓".green());
-    }
+    // Offer to fix Makevars if needed
+    maybe_fix_makevars()?;
 
     Ok(())
 }
@@ -237,6 +263,13 @@ async fn cmd_install(
     // Resolver wiring comes later — for now we just verify the parser
     // and bail early if the user asked for a GitHub package.
     if retry {
+        // Bug #50c: apply the Makevars fix before retrying. The retry path used
+        // to short-circuit straight into retry_install(), skipping every Fortran
+        // fix below — so `rin install --retry` rebuilt RcppArmadillo with the
+        // same stale FLIBS and failed identically. gfortran is reliably present
+        // by retry time (the first run's pre-flight installed it), so this now
+        // detects and rewrites the bad path before the rebuild.
+        maybe_fix_makevars()?;
         println!("{}", "Retrying failed packages...".dimmed());
         installer::retry_install().await?;
         return Ok(());
@@ -247,21 +280,7 @@ async fn cmd_install(
     // the Fortran-path mismatch bit them on install with a confusing error.
     // Run the same auto-fix at install start so RcppArmadillo / Matrix /
     // RcppEigen / fracdiff / SparseM / minqa work first try on macOS.
-    if let Some(fix) = sysreq::check_makevars() {
-        println!(
-            "{} R's Fortran paths are misconfigured:",
-            "⚠".yellow()
-        );
-        println!("  R looks in:      {}", fix.bad_paths.join(", "));
-        println!("  gfortran is at:  {}", fix.correct_lib);
-        println!(
-            "  {} writing fix to {}",
-            "→".blue(),
-            fix.makevars_path.display()
-        );
-        sysreq::fix_makevars(&fix)?;
-        println!("  {} Makevars updated.\n", "✓".green());
-    }
+    maybe_fix_makevars()?;
     // Bug #14: warn when gcc is too new for older R packages.
     if let Some((major, _)) = sysreq::detect_gcc_version() {
         if major >= 15 {
@@ -534,6 +553,21 @@ let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names
         }
 
     }
+
+    // Bug #50b: re-run the Makevars fix AFTER the pre-flight sysreq install.
+    //
+    // The first attempt (above, near install start) runs before gfortran may
+    // exist on the machine. check_makevars() bails early when `gfortran` isn't
+    // on PATH, so on a fresh box it returns None and writes nothing. The
+    // pre-flight check then `brew install`s gcc/gfortran — but by that point the
+    // Makevars fix was already skipped, and R's FLIBS still points at the
+    // nonexistent /opt/gfortran/lib. RcppArmadillo / Matrix / RcppEigen then
+    // fail to link gfortran on first build.
+    //
+    // Re-running here closes that window: now that gfortran is installed, write
+    // the correct FLIBS path before any package builds. Idempotent — returns
+    // None if the earlier pass already wrote the fix.
+    maybe_fix_makevars()?;
 
     println!("\n{}", "Installing packages...".dimmed());
     installer::install(&resolved,&registry.bioc_version).await?;

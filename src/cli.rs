@@ -49,8 +49,8 @@ pub enum Commands {
     ///
     /// Example: rin audit DESeq2
     Audit {
-        /// Package names to audit
-        #[arg(required = true)]
+        /// Package names to audit. Optional — defaults to the roots in the
+        /// current rin.lock so `rin audit` works bare inside a venv.
         packages: Vec<String>,
     },
 
