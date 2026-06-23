@@ -53,6 +53,93 @@ Done. No sudo, no conda, no `BiocManager::install` incantations, no manual syste
 
 ---
 
+## Installation
+
+### One-line install (recommended)
+
+```bash
+curl -sSf https://raw.githubusercontent.com/Ajinkya2910/rin/main/install.sh | sh
+```
+
+This downloads a statically-linked binary to `~/.rin/bin/rin`. Add it to your PATH:
+
+```bash
+export PATH="$HOME/.rin/bin:$PATH"   # one-time, current shell
+echo 'export PATH="$HOME/.rin/bin:$PATH"' >> ~/.bashrc   # persistent
+```
+
+### Supported platforms
+
+| Target | Status |
+|---|---|
+| Linux x86_64 (musl, works on any distro) | ✅ |
+| macOS arm64 (Apple Silicon) | ✅ |
+| macOS x86_64 (Intel) | ✅ |
+| Linux aarch64 | ⏳ planned |
+| Windows | ⏳ planned |
+
+### Build from source
+
+```bash
+git clone https://github.com/Ajinkya2910/rin
+cd rin
+cargo build --release
+```
+
+Requires Rust 1.70+.
+
+---
+
+## Commands
+
+```bash
+rin resolve <pkg>...        # show the full dependency tree without installing
+rin audit <pkg>...          # check system deps against the resolved tree
+rin install <pkg>...        # resolve, audit, download, compile, install
+rin lock <pkg>...           # write rin.lock with pinned versions
+rin restore                 # reproduce environment from rin.lock
+rin why <pkg>               # trace why a package is in the tree
+rin venv [path]             # create a project-isolated R library (default: .rin)
+rin venv-info               # show the active venv
+rin venv-remove [path]      # delete a virtual environment (default: .rin)
+```
+
+**`rin install` flags:**
+
+```bash
+--retry                     # resume a previously failed install
+--ignore-missing <LIB>      # ignore one missing system lib (repeatable)
+--skip-sysreq               # skip the sysreq pre-flight entirely
+--strict-sysreq             # hard-fail when sysreqs look missing (CI gate)
+```
+
+---
+
+## Installing from GitHub
+
+Not every package lives on CRAN or Bioconductor. rin installs straight from a GitHub repository, using the same spec syntax as `pak` and `remotes`:
+
+```bash
+rin install satijalab/seurat-wrappers       # bare owner/repo (default branch)
+rin install gh:satijalab/seurat-wrappers    # explicit gh: prefix (identical)
+rin install immunogenomics/harmony@v1.2.0   # pin a tag
+rin install owner/repo@main                 # a branch
+rin install owner/repo@a1b2c3d              # an exact commit SHA
+rin install owner/monorepo/sub/dir          # package in a subdirectory
+```
+
+rin resolves the ref to an exact commit SHA via the GitHub API, downloads the tarball from codeload, and caches it by SHA so repeat installs are instant. A CRAN/Bioconductor name can never contain a `/`, so a bare `owner/repo` is always unambiguous.
+
+**Transitive GitHub deps are followed automatically.** If a package's `DESCRIPTION` declares `Remotes: github::owner/repo`, rin pulls those sources too — you don't list every GitHub dependency by hand.
+
+For private repos or to lift GitHub's unauthenticated rate limit, set a token:
+
+```bash
+export GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxx
+```
+
+---
+
 ## What rin does differently
 
 ### 1. Constraint-aware dependency resolution
@@ -168,93 +255,6 @@ One missing header. 6 packages fail. No pre-flight check to catch it. This is ex
 | Lockfile (first-class workflow) | ✅ TOML | ❌ | ⚠️ peripheral (`pak::lockfile_create()`) | ✅ R-specific |
 | Virtual environments | ✅ | ❌ | ❌ | ✅ |
 | Binary cache (today) | ❌ (planned) | ❌ | ✅ via PPM | ❌ |
-
----
-
-## Installation
-
-### One-line install (recommended)
-
-```bash
-curl -sSf https://raw.githubusercontent.com/Ajinkya2910/rin/main/install.sh | sh
-```
-
-This downloads a statically-linked binary to `~/.rin/bin/rin`. Add it to your PATH:
-
-```bash
-export PATH="$HOME/.rin/bin:$PATH"   # one-time, current shell
-echo 'export PATH="$HOME/.rin/bin:$PATH"' >> ~/.bashrc   # persistent
-```
-
-### Supported platforms
-
-| Target | Status |
-|---|---|
-| Linux x86_64 (musl, works on any distro) | ✅ |
-| macOS arm64 (Apple Silicon) | ✅ |
-| macOS x86_64 (Intel) | ✅ |
-| Linux aarch64 | ⏳ planned |
-| Windows | ⏳ planned |
-
-### Build from source
-
-```bash
-git clone https://github.com/Ajinkya2910/rin
-cd rin
-cargo build --release
-```
-
-Requires Rust 1.70+.
-
----
-
-## Commands
-
-```bash
-rin resolve <pkg>...        # show the full dependency tree without installing
-rin audit <pkg>...          # check system deps against the resolved tree
-rin install <pkg>...        # resolve, audit, download, compile, install
-rin lock <pkg>...           # write rin.lock with pinned versions
-rin restore                 # reproduce environment from rin.lock
-rin why <pkg>               # trace why a package is in the tree
-rin venv [path]             # create a project-isolated R library (default: .rin)
-rin venv-info               # show the active venv
-rin venv-remove [path]      # delete a virtual environment (default: .rin)
-```
-
-**`rin install` flags:**
-
-```bash
---retry                     # resume a previously failed install
---ignore-missing <LIB>      # ignore one missing system lib (repeatable)
---skip-sysreq               # skip the sysreq pre-flight entirely
---strict-sysreq             # hard-fail when sysreqs look missing (CI gate)
-```
-
----
-
-## Installing from GitHub
-
-Not every package lives on CRAN or Bioconductor. rin installs straight from a GitHub repository, using the same spec syntax as `pak` and `remotes`:
-
-```bash
-rin install satijalab/seurat-wrappers       # bare owner/repo (default branch)
-rin install gh:satijalab/seurat-wrappers    # explicit gh: prefix (identical)
-rin install immunogenomics/harmony@v1.2.0   # pin a tag
-rin install owner/repo@main                 # a branch
-rin install owner/repo@a1b2c3d              # an exact commit SHA
-rin install owner/monorepo/sub/dir          # package in a subdirectory
-```
-
-rin resolves the ref to an exact commit SHA via the GitHub API, downloads the tarball from codeload, and caches it by SHA so repeat installs are instant. A CRAN/Bioconductor name can never contain a `/`, so a bare `owner/repo` is always unambiguous.
-
-**Transitive GitHub deps are followed automatically.** If a package's `DESCRIPTION` declares `Remotes: github::owner/repo`, rin pulls those sources too — you don't list every GitHub dependency by hand.
-
-For private repos or to lift GitHub's unauthenticated rate limit, set a token:
-
-```bash
-export GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxx
-```
 
 ---
 
