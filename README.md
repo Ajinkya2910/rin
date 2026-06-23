@@ -137,7 +137,7 @@ All numbers below are from a real run on a GWU HPC login node (Rocky Linux, x86_
 >
 > When PPM doesn't cover your platform — macOS conda-R, non-mainstream Linux distros, aarch64, air-gapped HPC, custom toolchains — pak falls back to source compilation and hits the same cascade failures as BiocManager. rin's pre-flight audit handles the source-build path reliably across all of those environments today.
 >
-> rin will match pak's binary-cache speed when [Phase 2 infrastructure](#roadmap) ships (Hetzner build farm + Cloudflare R2 storage, Bioconductor-first, HPC-targeted). Until then, rin's value is **always-reliable source builds**, not raw speed.
+> rin will match pak's binary-cache speed once binary-cache infrastructure ships (a build farm + CDN-backed storage, Bioconductor-first, HPC-targeted). Until then, rin's value is **always-reliable source builds**, not raw speed.
 
 ### BiocManager cascade: root cause
 
@@ -167,7 +167,7 @@ One missing header. 6 packages fail. No pre-flight check to catch it. This is ex
 | Parallel compilation | ✅ (tiers + rayon) | ⚠️ via `Ncpus` | ✅ | ❌ |
 | Lockfile (first-class workflow) | ✅ TOML | ❌ | ⚠️ peripheral (`pak::lockfile_create()`) | ✅ R-specific |
 | Virtual environments | ✅ | ❌ | ❌ | ✅ |
-| Binary cache (today) | ❌ (Phase 2) | ❌ | ✅ via PPM | ❌ |
+| Binary cache (today) | ❌ (planned) | ❌ | ✅ via PPM | ❌ |
 
 ---
 
@@ -233,45 +233,41 @@ rin venv-remove [path]      # delete a virtual environment (default: .rin)
 
 ---
 
+## Installing from GitHub
+
+Not every package lives on CRAN or Bioconductor. rin installs straight from a GitHub repository, using the same spec syntax as `pak` and `remotes`:
+
+```bash
+rin install satijalab/seurat-wrappers       # bare owner/repo (default branch)
+rin install gh:satijalab/seurat-wrappers    # explicit gh: prefix (identical)
+rin install immunogenomics/harmony@v1.2.0   # pin a tag
+rin install owner/repo@main                 # a branch
+rin install owner/repo@a1b2c3d              # an exact commit SHA
+rin install owner/monorepo/sub/dir          # package in a subdirectory
+```
+
+rin resolves the ref to an exact commit SHA via the GitHub API, downloads the tarball from codeload, and caches it by SHA so repeat installs are instant. A CRAN/Bioconductor name can never contain a `/`, so a bare `owner/repo` is always unambiguous.
+
+**Transitive GitHub deps are followed automatically.** If a package's `DESCRIPTION` declares `Remotes: github::owner/repo`, rin pulls those sources too — you don't list every GitHub dependency by hand.
+
+For private repos or to lift GitHub's unauthenticated rate limit, set a token:
+
+```bash
+export GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxx
+```
+
+---
+
 ## Honest limitations
 
 Because credibility matters more than marketing:
 
-- **No binary cache today.** rin compiles everything from source. Phase 2 (planned) adds Bioconductor + CRAN binary infrastructure.
-- **Linux and macOS only.** Windows support is on the roadmap but not trivial due to Rtools and different sysreq tooling.
+- **No binary cache today.** rin compiles everything from source. Bioconductor + CRAN binary infrastructure is planned.
+- **Linux and macOS only.** Windows support is planned but not trivial due to Rtools and different sysreq tooling.
 - **Not every edge case of CRAN's PACKAGES format is handled.** The resolver works on the DESeq2 / Seurat-scale dependency trees (tested with 55- and 142-package installs); rarer metadata quirks may surface.
 - **System dependency mappings are curated.** rin flags a package's `SystemRequirements:` even when it isn't in `SYSREQ_MAP`. But if a package needs a system lib it doesn't declare anywhere rin can see, rin can't pre-warn and the compiler surfaces the error instead of rin's friendly one. Adding the package to `SYSREQ_MAP` fixes it — PRs welcome.
 
 If any of those blockers hit you, file an issue. rin is production-used at small scale today; corner cases surface with wider adoption.
-
----
-
-## Roadmap
-
-### Shipped
-- Constraint-aware resolver (CRAN + Bioconductor, cross-registry)
-- Cross-platform sysreq audit (Debian/Ubuntu, RHEL/Rocky/Fedora, macOS)
-- Parallel tier-based compilation
-- Virtual environments with activate/deactivate
-- TOML lockfiles with `rin lock` / `rin restore`
-- CRAN Archive fallback for older versions
-- One-line installer
-
-### Phase 2 — binary cache infrastructure
-- Hetzner build farm for Linux x86_64 + aarch64 binaries
-- Cloudflare R2 for storage (CDN-backed)
-- Coverage priorities: Bioconductor first, popular CRAN second
-- Expected: seconds-not-minutes installs for the common case
-
-### Phase 3 — ecosystem parity
-- Windows support
-- Full CRAN coverage in binary cache
-- Integration with HPC module systems (auto-suggest `module load`)
-
-### Nice-to-haves
-- `rin use R@4.5.0` — manage R versions directly, like rustup for R
-- Multi-progress UI (per-package status, like uv)
-- `rin compare` — dependency footprint comparison across packages
 
 ---
 
