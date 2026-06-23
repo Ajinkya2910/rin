@@ -28,14 +28,20 @@ rin runs a pre-flight audit *before* it starts compiling: does the compiler exis
 
 ## Quick start
 
-**Install rin** (one line, no Rust toolchain needed):
+**1. Install rin** (one line, no Rust toolchain needed):
 
 ```bash
 curl -sSf https://raw.githubusercontent.com/Ajinkya2910/rin/main/install.sh | sh
 export PATH="$HOME/.rin/bin:$PATH"
 ```
 
-**Install DESeq2 into an isolated environment:**
+This drops a statically-linked binary at `~/.rin/bin/rin`. To make it permanent:
+
+```bash
+echo 'export PATH="$HOME/.rin/bin:$PATH"' >> ~/.bashrc
+```
+
+**2. Install DESeq2 into an isolated environment:**
 
 ```bash
 rin venv myproject
@@ -50,23 +56,6 @@ Done. No sudo, no conda, no `BiocManager::install` incantations, no manual syste
 `rin resolve` · `rin audit` · `rin install` · `rin lock` · `rin restore` · `rin why` · `rin venv`
 
 (Detailed reference [below](#commands).)
-
----
-
-## Installation
-
-### One-line install (recommended)
-
-```bash
-curl -sSf https://raw.githubusercontent.com/Ajinkya2910/rin/main/install.sh | sh
-```
-
-This downloads a statically-linked binary to `~/.rin/bin/rin`. Add it to your PATH:
-
-```bash
-export PATH="$HOME/.rin/bin:$PATH"   # one-time, current shell
-echo 'export PATH="$HOME/.rin/bin:$PATH"' >> ~/.bashrc   # persistent
-```
 
 ### Supported platforms
 
@@ -137,6 +126,32 @@ For private repos or to lift GitHub's unauthenticated rate limit, set a token:
 ```bash
 export GITHUB_TOKEN=ghp_xxxxxxxxxxxxxxxx
 ```
+
+---
+
+## Running on HPC
+
+HPC clusters are where R package management hurts most: no root, no `apt`, conda-R everywhere, and system libraries that come from `module load` instead of a package manager. This is rin's home turf — a single static binary, no bootstrap, no background R process, no system-R assumptions.
+
+On a login node:
+
+```bash
+# 1. Drop the static binary in your home dir (no sudo, no module needed for rin itself)
+curl -sSf https://raw.githubusercontent.com/Ajinkya2910/rin/main/install.sh | sh
+export PATH="$HOME/.rin/bin:$PATH"
+
+# 2. Load the cluster's R + compiler toolchain (names vary; `module spider R` to find them)
+module load R gcc
+
+# 3. Isolated env + install, straight from the login node
+rin venv deseq2-env
+source deseq2-env/activate
+rin install DESeq2
+```
+
+That's the exact path benchmarked on a GWU HPC login node (Rocky Linux, R 4.4.2): **56 packages, first try, 6m 02s** — on the same conda-R toolchain where `BiocManager` and `pak` both cascade-fail.
+
+**When a system lib lives in a module rin can't probe:** the pre-flight is advisory, so rin lists what looks missing and proceeds anyway. If you've already `module load`ed the library, silence a specific advisory with `--ignore-missing <lib>` or skip the check entirely with `--skip-sysreq`. When a library genuinely is missing, rin points you at the `module spider` / `module load` to fix it.
 
 ---
 
