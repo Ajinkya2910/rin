@@ -141,10 +141,30 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> 
             break;
         }
 
+        // Show which packages are in this batch, not just the count. In a real
+        // terminal the progress bar below also surfaces the current package,
+        // but in a non-TTY console (e.g. RStudio) the bar doesn't render, so
+        // this line is the only signal of what's compiling. Cap the list so a
+        // large tier doesn't flood the screen.
+        const MAX_NAMES: usize = 8;
+        let names: Vec<&str> = ready.iter().map(|p| p.name.as_str()).collect();
+        let shown = names
+            .iter()
+            .take(MAX_NAMES)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let suffix = if names.len() > MAX_NAMES {
+            format!(", … +{} more", names.len() - MAX_NAMES)
+        } else {
+            String::new()
+        };
         println!(
-            "\n  {} Installing {} package(s) in parallel",
+            "\n  {} Installing {} package(s) in parallel: {}{}",
             "→".blue(),
-            ready.len()
+            ready.len(),
+            shown.dimmed(),
+            suffix.dimmed()
         );
 
         // Install this tier in parallel using rayon
