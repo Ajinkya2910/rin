@@ -1,9 +1,16 @@
 # .github/workflows/release.yml
 #
 # HOW THIS WORKS:
-# When you push a git tag like v0.1.0, this workflow runs on three machines
-# simultaneously — Linux, macOS ARM, macOS Intel. Each compiles rin into a
-# standalone binary, zips it, and uploads it to GitHub Releases.
+# When you push a git tag like v0.1.0, this workflow builds rin on three
+# machines — Linux, macOS ARM, macOS Intel — in parallel. Each uploads its
+# binary as a build artifact. A final `release` job then collects all three
+# and publishes ONE GitHub Release.
+#
+# WHY TWO JOBS:
+# Previously every matrix job created the release itself. Running in parallel,
+# they raced to create the same tag and GitHub rejected the losers with
+# "already_exists: tag_name", leaving releases with missing binaries. Creating
+# the release exactly once, after all builds finish, removes that race.
 #
 # USAGE:
 #   git tag v0.1.0
@@ -11,7 +18,7 @@
 #
 # After ~10 minutes, check https://github.com/Ajinkya2910/rin/releases
 # You'll see three downloadable files:
-#   rin-x86_64-unknown-linux-gnu.tar.gz    (Linux HPC)
+#   rin-x86_64-unknown-linux-musl.tar.gz   (Linux HPC)
 #   rin-aarch64-apple-darwin.tar.gz        (macOS ARM / Apple Silicon)
 #   rin-x86_64-apple-darwin.tar.gz         (macOS Intel)
 
@@ -29,12 +36,6 @@ permissions:
 
 jobs:
   build:
-    # RUST CONCEPT: Cross-compilation targets
-    # Rust calls each OS+CPU combo a "target triple":
-    #   x86_64-unknown-linux-gnu  = Linux on Intel/AMD (your HPC)
-    #   aarch64-apple-darwin      = macOS on Apple Silicon (your Mac)
-    #   x86_64-apple-darwin       = macOS on older Intel Macs
-    #
     # matrix.include runs this job three times in parallel, once per target.
     strategy:
       matrix:
@@ -62,20 +63,39 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y musl-tools
 
       # Step 3: Compile rin in release mode (optimized binary)
-      # --release turns on optimizations — the binary is ~5x smaller and faster
       - name: Build
         run: cargo build --release --target ${{ matrix.target }}
 
       # Step 4: Package the binary into a tarball
-      # The binary is at target/{target}/release/rin
       - name: Package
         run: |
           cd target/${{ matrix.target }}/release
           tar czf ../../../rin-${{ matrix.target }}.tar.gz rin
           cd ../../..
 
-      # Step 5: Upload to GitHub Releases
-      - name: Upload to Release
+      # Step 5: Hand the tarball off to the release job as an artifact.
+      # No release is created here — that happens once, in `release` below.
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rin-${{ matrix.target }}
+          path: rin-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    # Wait for all three builds, then publish a single release with all assets.
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      # Collect every build artifact, flattened into one directory.
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # Create the release exactly once and attach all three binaries.
+      - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          files: rin-${{ matrix.target }}.tar.gz
+          files: dist/*.tar.gz
