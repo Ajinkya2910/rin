@@ -1,0 +1,20 @@
+Package: rin
+Type: Package
+Title: RStudio Interface to the 'rin' R Package Manager
+Version: 0.1.0
+Authors@R: person("Ajinkya", "Patil", email = "pajinkya66@gmail.com",
+    role = c("aut", "cre"))
+Description: A thin wrapper around the 'rin' command-line R package manager,
+    letting you install, audit, resolve and manage project-local
+    environments from inside R and RStudio. It locates the 'rin' binary
+    (even when it is not on the GUI session's PATH), streams the binary's
+    live output to the R console, and refreshes the library search path so
+    that freshly installed packages are usable immediately, without
+    restarting the session.
+License: MIT + file LICENSE
+URL: https://github.com/Ajinkya2910/rin
+BugReports: https://github.com/Ajinkya2910/rin/issues
+Encoding: UTF-8
+SystemRequirements: rin (https://github.com/Ajinkya2910/rin)
+Roxygen: list(markdown = TRUE)
+RoxygenNote: 7.3.2

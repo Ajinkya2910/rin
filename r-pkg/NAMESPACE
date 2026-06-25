@@ -1,0 +1,11 @@
+# Hand-maintained (no roxygen build step required to install).
+# Exported with bare names so calls read as rin::install("DESeq2").
+export(install)
+export(audit)
+export(resolve)
+export(venv)
+export(venv_remove)
+export(info)
+export(status)
+export(rin_path)
+export(rin_version)
