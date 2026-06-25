@@ -358,9 +358,6 @@ async fn fetch_and_parse(url: &str, source: PackageSource) -> Result<Vec<Package
 
 /// Detect the installed R version by running `R --version`
 fn detect_r_version() -> Result<String> {
-    // TEMPORARY: fake old R version to test constraint checking
-       //return Ok("4.3.0".to_string());
-
     use std::process::Command;
 
     // RUST CONCEPT: std::process::Command
@@ -370,21 +367,32 @@ fn detect_r_version() -> Result<String> {
         .output()
         .context("R is not installed. Install R first: https://cran.r-project.org")?;
 
+    // `R --version` normally prints "R version 4.4.0 (...)" to stdout, but when
+    // rin is spawned from a GUI R session (e.g. RStudio) the banner can land on
+    // stderr, or be preceded by a locale/startup warning line. Be liberal: scan
+    // BOTH streams, every line, for the first "R version X.Y.Z" we can find.
     let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
 
-    // Parse version from output like "R version 4.4.0 (2024-04-24)"
-    // RUST CONCEPT: `if let` is a concise pattern match for a single case.
-    // It's like: if the pattern matches, run this code; otherwise skip.
-    if let Some(line) = stdout.lines().next() {
-        if let Some(version_str) = line.strip_prefix("R version ") {
-            if let Some(version) = version_str.split_whitespace().next() {
-                return Ok(version.to_string());
+    for stream in [stdout.as_ref(), stderr.as_ref()] {
+        for line in stream.lines() {
+            if let Some(rest) = line.trim_start().strip_prefix("R version ") {
+                if let Some(version) = rest.split_whitespace().next() {
+                    // Sanity-check it looks like a version (e.g. "4.4.1"), so a
+                    // stray "R version unknown" line can't slip through.
+                    if version.starts_with(|c: char| c.is_ascii_digit()) {
+                        return Ok(version.to_string());
+                    }
+                }
             }
         }
     }
 
-    // RUST CONCEPT: anyhow::bail! is a macro that creates an error and returns early.
-    // It's shorthand for: return Err(anyhow::anyhow!("message"))
-    anyhow::bail!("Could not detect R version from `R --version` output")
+    // Echo what R actually printed so any remaining edge case is self-diagnosing.
+    anyhow::bail!(
+        "Could not detect R version from `R --version` output.\n  stdout: {}\n  stderr: {}",
+        stdout.trim(),
+        stderr.trim()
+    )
 }
 

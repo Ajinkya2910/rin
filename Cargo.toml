@@ -6,7 +6,7 @@
 # The crate name on crates.io. The short name `rin` is held by an abandoned
 # 2016 crate, so we publish as `rin-cli` but ship the binary as `rin`.
 name = "rin-cli"
-version = "0.2.12"                    # Semantic versioning
+version = "0.2.13"                    # Semantic versioning
 edition = "2021"                     # Rust edition (like Python 3.x vs 2.x)
 description = "Fast R package manager for life sciences"
 license = "MIT"
