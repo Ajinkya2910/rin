@@ -102,6 +102,28 @@ rin venv-remove [path]      # delete a virtual environment (default: .rin)
 --strict-sysreq             # hard-fail when sysreqs look missing (CI gate)
 ```
 
+### `install` vs `restore`
+
+These two are easy to confuse — they operate at different scopes:
+
+| Command | Installs | Fails if… | Use when |
+|---|---|---|---|
+| `rin install <pkg>` | just `<pkg>` + its dependencies | `<pkg>` (or its deps) fails | you want to add/install a specific package |
+| `rin restore` | **everything** in `rin.lock` | **anything** in the lock fails | rebuilding a whole project |
+
+`rin.lock` is a full project manifest: every package you've installed is recorded
+as a *root*, alongside the complete resolved dependency tree. So `rin install X`
+adds `X` to the lock and installs only what `X` needs — an unrelated broken
+package elsewhere in the lock won't block it. `rin restore` is the command that
+(re)builds the entire locked project.
+
+**Reproducibility:** commit `rin.lock` to your repo. On any other machine, `rin
+restore` rebuilds the exact same environment — same packages, same versions. This
+is the project-portability workflow (`git clone` → `rin restore`).
+
+> Mental model: **`install` = "give me this one thing"; `restore` = "make my
+> whole project whole."**
+
 ---
 
 ## Installing from GitHub

@@ -249,6 +249,80 @@ async fn cmd_audit(packages: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// Compute the dependency closure of `roots` within an already-resolved set.
+///
+/// Returns a `ResolvedDeps` containing only the requested packages plus
+/// everything they transitively depend on, preserving the deps-first install
+/// order. This is what `rin install X` actually installs — so an unrelated
+/// broken package elsewhere in rin.lock (e.g. another project root) never gets
+/// re-attempted or blocks the install.
+fn requested_closure(
+    resolved: &resolver::ResolvedDeps,
+    roots: &[String],
+) -> resolver::ResolvedDeps {
+    use std::collections::{HashSet, VecDeque};
+
+    let by_name: std::collections::HashMap<&str, &resolver::ResolvedPackage> =
+        resolved.packages.iter().map(|p| (p.name.as_str(), p)).collect();
+
+    let mut keep: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<String> = roots.iter().cloned().collect();
+    while let Some(name) = queue.pop_front() {
+        if !keep.insert(name.clone()) {
+            continue;
+        }
+        if let Some(pkg) = by_name.get(name.as_str()) {
+            for dep in &pkg.dependencies {
+                if !keep.contains(dep) {
+                    queue.push_back(dep.clone());
+                }
+            }
+        }
+    }
+
+    let packages = resolved
+        .packages
+        .iter()
+        .filter(|p| keep.contains(&p.name))
+        .cloned()
+        .collect();
+    resolver::ResolvedDeps {
+        packages,
+        duration_secs: resolved.duration_secs,
+    }
+}
+
+/// True when the on-disk rin.lock already matches the roots + resolved versions
+/// we'd otherwise write — so a re-install is a genuine no-op and we can skip the
+/// rewrite (and the misleading "Wrote rin.lock" line).
+fn lock_is_current(
+    existing: Option<&lockfile::Lockfile>,
+    roots: &[String],
+    resolved: &resolver::ResolvedDeps,
+) -> bool {
+    let Some(existing) = existing else {
+        return false;
+    };
+    let existing_roots: std::collections::HashSet<&str> =
+        existing.metadata.roots.iter().map(String::as_str).collect();
+    let new_roots: std::collections::HashSet<&str> =
+        roots.iter().map(String::as_str).collect();
+    if existing_roots != new_roots {
+        return false;
+    }
+    let existing_pkgs: std::collections::HashSet<(&str, &str)> = existing
+        .packages
+        .iter()
+        .map(|p| (p.name.as_str(), p.version.as_str()))
+        .collect();
+    let new_pkgs: std::collections::HashSet<(&str, &str)> = resolved
+        .packages
+        .iter()
+        .map(|p| (p.name.as_str(), p.version.as_str()))
+        .collect();
+    existing_pkgs == new_pkgs
+}
+
 /// Install packages
 async fn cmd_install(
     packages: &[String],
@@ -337,59 +411,66 @@ async fn cmd_install(
 
    
 
-    // Merge incremental installs into existing rin.lock instead of clobbering.
-let mut all_roots: Vec<String> = packages.to_vec();
-if let Ok(existing) = lockfile::read("rin.lock") {
-    let prior_roots: Vec<String> = if existing.metadata.roots.is_empty() {
-        // Old-format lockfile — fall back to using all packages as roots
-        // so we don't silently lose them on incremental install.
-        existing.packages.iter().map(|p| p.name.clone()).collect()
-    } else {
-        existing.metadata.roots.clone()
-    };
-    let before = all_roots.len();
-    for r in prior_roots {
-        if !all_roots.contains(&r) {
-            all_roots.push(r);
+    // rin.lock is a full project manifest: all roots ever requested, plus their
+    // resolved closures, so `rin restore` can rebuild the whole environment.
+    // We therefore merge this invocation's packages into the existing roots and
+    // resolve everything together (keeps versions consistent across the project)
+    // — but the *installation* below is scoped to just what was asked for now.
+    let existing_lock = lockfile::read("rin.lock").ok();
+    let mut all_roots: Vec<String> = packages.to_vec();
+    if let Some(existing) = &existing_lock {
+        let prior_roots: Vec<String> = if existing.metadata.roots.is_empty() {
+            // Old-format lockfile — fall back to using all packages as roots
+            // so we don't silently lose them on incremental install.
+            existing.packages.iter().map(|p| p.name.clone()).collect()
+        } else {
+            existing.metadata.roots.clone()
+        };
+        for r in prior_roots {
+            if !all_roots.contains(&r) {
+                all_roots.push(r);
+            }
         }
     }
-    if all_roots.len() > before {
+
+    let parsed: Vec<source::PackageSource> = all_roots
+        .iter()
+        .map(|s| source::PackageSource::parse(s))
+        .collect::<Result<Vec<_>>>()?;
+    let root_names = sat_resolver::prepare_github_packages(&mut registry, &parsed).await?;
+
+    let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names).await?;
+
+    // `root_names` is 1:1 with `all_roots` (requested first, then prior roots),
+    // so the first `packages.len()` entries are THIS invocation's requested
+    // packages — resolved to real names (handles gh: specs too). Their closure
+    // is all we install and all we fail on.
+    let requested_roots: Vec<String> =
+        root_names.iter().take(packages.len()).cloned().collect();
+    let scoped = requested_closure(&resolved, &requested_roots);
+
+    // Write rin.lock (the full project) only when it actually changes — avoids a
+    // misleading "Wrote rin.lock" on a no-op re-install. We still write the full
+    // `resolved` so `rin why` / `rin restore` see the whole project.
+    if lock_is_current(existing_lock.as_ref(), &all_roots, &resolved) {
+        println!("  {} rin.lock unchanged", "·".dimmed());
+    } else {
+        let lockfile_path = lockfile::write(
+            &resolved,
+            &all_roots,
+            &registry.r_version,
+            &registry.bioc_version,
+        )?;
         println!(
-            "  {} merging with {} prior root(s) from rin.lock",
-            "↻".blue(),
-            all_roots.len() - before
+            "  {} Wrote {} ({} packages)",
+            "→".dimmed(),
+            lockfile_path.display(),
+            resolved.packages.len()
         );
     }
-}
-
-// Then parse all_roots instead of packages:
-let parsed: Vec<source::PackageSource> = all_roots
-    .iter()
-    .map(|s| source::PackageSource::parse(s))
-    .collect::<Result<Vec<_>>>()?;
-let root_names = sat_resolver::prepare_github_packages(&mut registry, &parsed).await?;
-
-let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names).await?;
-
-    // write rin.lock immediately after resolve succeeds, so:
-    //   - `rin why` works mid-failure (it reads rin.lock)
-    //   - `rin install --retry` has a lockfile to read
-    //   - The lockfile reflects intent, not just successful completion
-    let lockfile_path = lockfile::write(
-        &resolved,
-        &all_roots,
-        &registry.r_version,
-        &registry.bioc_version,
-    )?;
-    println!(
-        "  {} Wrote {} ({} packages)",
-        "→".dimmed(),
-        lockfile_path.display(),
-        resolved.packages.len()
-    );
     // Bug #44 + #49: warn about HDF5/MPI module misconfigurations before
     // the user wastes time waiting for hdf5r to fail.
-    let pkg_names: Vec<String> = resolved.packages.iter().map(|p| p.name.clone()).collect();
+    let pkg_names: Vec<String> = scoped.packages.iter().map(|p| p.name.clone()).collect();
     if let Some(warning) = sysreq::detect_hdf5_problem(&pkg_names) {
         println!("\n{} {}\n", "⚠".yellow(), warning);
     }
@@ -403,7 +484,7 @@ let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names
         );
     } else {
         println!("{}", "Pre-flight check: system dependencies...".dimmed());
-        let mut report = sysreq::audit(&resolved).await?;
+        let mut report = sysreq::audit(&scoped).await?;
 
         // #2: surgical override — drop user-named libs from the missing list.
         if !ignore_missing.is_empty() {
@@ -621,13 +702,42 @@ let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names
     maybe_fix_makevars()?;
 
     println!("\n{}", "Installing packages...".dimmed());
-    installer::install(&resolved,&registry.bioc_version).await?;
+    installer::install(&scoped, &registry.bioc_version).await?;
 
     println!(
         "\n{} All {} packages installed successfully!",
         "✓".green(),
-        resolved.packages.len()
+        scoped.packages.len()
     );
+
+    // Contextual nudge to `rin restore`: if the project (full resolved set) has
+    // packages outside what we just installed that aren't built, the user has a
+    // partially-built project. Point them at the one command that fixes it,
+    // teaching `restore` exactly when it matters.
+    let scoped_names: std::collections::HashSet<&str> =
+        scoped.packages.iter().map(|p| p.name.as_str()).collect();
+    let others: Vec<resolver::ResolvedPackage> = resolved
+        .packages
+        .iter()
+        .filter(|p| !scoped_names.contains(p.name.as_str()))
+        .cloned()
+        .collect();
+    if !others.is_empty() {
+        let installed = installer::check_installed_versions(&others);
+        let unbuilt = others.len() - installed.len();
+        if unbuilt > 0 {
+            println!(
+                "\n{} {} other package(s) in rin.lock aren't built yet.",
+                "ℹ".blue(),
+                unbuilt
+            );
+            println!(
+                "  Run {} (or {} in RStudio) to build the whole project.",
+                "rin restore".bold(),
+                "rin::restore()".bold()
+            );
+        }
+    }
 
     Ok(())
 }
@@ -951,7 +1061,7 @@ async fn cmd_venv_create(path: &str, r_version: Option<String>) -> Result<()> {
         Some(v) => v,
         None => {
             // Auto-detect from system
-            let output = std::process::Command::new("R")
+            let output = crate::installer::r_command()
                 .args(["--vanilla", "--slave", "-e", "cat(paste0(R.version$major, '.', R.version$minor))"])
                 .output();
             match output {

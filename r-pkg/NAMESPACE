@@ -3,6 +3,7 @@
 export(install)
 export(audit)
 export(resolve)
+export(restore)
 export(venv)
 export(venv_remove)
 export(info)

@@ -710,12 +710,32 @@ fn extract_quoted(line: &str) -> Option<&str> {
     }
     None
 }
+/// Build a `Command` for the R binary, preferring the R that invoked rin.
+///
+/// When rin is spawned from an R session (e.g. RStudio), `R_HOME` points at
+/// that session's R. Invoking `$R_HOME/bin/R` by absolute path keeps rin on the
+/// *same* R the user is running, instead of whatever `R` is first on `PATH`.
+/// On machines with conda/anaconda, the PATH-first `R` is often a different
+/// install whose Makeconf lacks per-standard compilers (e.g. `CC17` undefined),
+/// breaking C17 packages like locfit even though the user's actual R is fine.
+pub fn r_command() -> Command {
+    if let Ok(home) = std::env::var("R_HOME") {
+        if !home.is_empty() {
+            let candidate = std::path::Path::new(&home).join("bin").join("R");
+            if candidate.is_file() {
+                return Command::new(candidate);
+            }
+        }
+    }
+    Command::new("R")
+}
+
 /// Run `R CMD INSTALL` against a tarball OR an extracted package directory.
 /// R CMD INSTALL accepts both — that's why this helper works for both paths.
 fn run_r_cmd_install(target: &PathBuf, pkg_name: &str) -> Result<()> {
     let lib_arg = get_venv_lib().map(|p| format!("--library={}", p.display()));
 
-    let mut cmd = Command::new("R");
+    let mut cmd = r_command();
     cmd.args(["CMD", "INSTALL", "--no-test-load"]);
     if let Some(ref lib) = lib_arg {
         cmd.arg(lib);
@@ -909,9 +929,9 @@ fn parse_compile_error(stderr: &str, pkg_name: &str) -> String {
     }
 
     // Linker errors (missing system library at link time)
-    if stderr.contains("undefined reference to") 
+    if stderr.contains("undefined reference to")
         || stderr.contains("symbol(s) not found")
-        || stderr.contains("ld: library not found") 
+        || stderr.contains("ld: library not found")
     {
         return with_sysreq_hint(
             "Linker error — a system library is missing or not found by the linker.\n  Fix: run rin audit to check system dependencies.".to_string(),
@@ -919,13 +939,35 @@ fn parse_compile_error(stderr: &str, pkg_name: &str) -> String {
         );
     }
 
-   
+    // R toolchain: a package requested a C/C++ standard whose compiler macro
+    // (e.g. CC17) is empty in the active R's Makeconf — "C17 standard requested
+    // but CC17 is not defined". Seen intermittently under heavy parallel builds;
+    // a retry usually clears it. Persisting usually means a stale/older R on
+    // PATH (< 4.3, before per-standard compilers) or a personal ~/.R/Makevars
+    // overriding CC/CXX.
+    if stderr.contains("standard requested but") && stderr.contains("is not defined") {
+        return format!(
+            "R toolchain: {} — a C/C++ standard's compiler is undefined in R's Makeconf.\n  \
+             Fix: usually transient — run `rin install --retry` (or rin::install(retry=TRUE)).\n  \
+             If it persists: ensure rin uses a current R (R --version ≥ 4.3) and that ~/.R/Makevars isn't overriding CC/CXX.",
+            stderr
+                .lines()
+                .find(|l| l.contains("standard requested but"))
+                .map(str::trim)
+                .unwrap_or("standard not defined")
+        );
+    }
 
-    // Generic: take the last meaningful error line
+    // Generic: take the last meaningful error line. Case-insensitive so a
+    // capitalized "Error:" (e.g. R's own build errors) isn't missed — that gap
+    // is what turned the CC17 failure above into a useless "Unknown" message.
     let last_error = stderr
         .lines()
         .rev()
-        .find(|l| l.contains("error:") || l.contains("ERROR"))
+        .find(|l| {
+            let lower = l.to_ascii_lowercase();
+            lower.contains("error:") || lower.contains("fatal error") || l.contains("ERROR")
+        })
         .unwrap_or("Unknown compilation error");
 
     // A bare "configuration failed" / generic compile error is the most common
@@ -984,7 +1026,7 @@ fn ensure_writable_library() -> Result<bool> {
     }
 
     // Ask R for its default library path.
-    let r_default: Option<PathBuf> = Command::new("R")
+    let r_default: Option<PathBuf> = r_command()
         .args(["--vanilla", "--slave", "-e", "cat(.libPaths()[1])"])
         .output()
         .ok()
@@ -1167,7 +1209,7 @@ pub fn list_installed_packages() -> std::collections::HashSet<String> {
         None => "cat(rownames(installed.packages()), sep='\\n')".to_string(),
     };
 
-    match Command::new("R")
+    match r_command()
         .args(["--vanilla", "--slave", "-e", &r_code])
         .output()
     {
@@ -1230,7 +1272,7 @@ pub fn check_installed_versions(packages: &[ResolvedPackage]) -> Vec<String> {
         candidates = candidates_r,
     );
 
-    let output = Command::new("R")
+    let output = r_command()
         .args(["--vanilla", "--slave", "-e", &r_code])
         .output();
 

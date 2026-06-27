@@ -358,11 +358,9 @@ async fn fetch_and_parse(url: &str, source: PackageSource) -> Result<Vec<Package
 
 /// Detect the installed R version by running `R --version`
 fn detect_r_version() -> Result<String> {
-    use std::process::Command;
-
     // RUST CONCEPT: std::process::Command
     // Like Python's subprocess.run(). Runs an external command.
-    let output = Command::new("R")
+    let output = crate::installer::r_command()
         .arg("--version")
         .output()
         .context("R is not installed. Install R first: https://cran.r-project.org")?;

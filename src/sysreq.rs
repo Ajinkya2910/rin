@@ -1186,7 +1186,7 @@ pub fn check_makevars() -> Option<MakevarsFix> {
         return None;
     }
 
-    let flibs_output = Command::new("R").args(["CMD", "config", "FLIBS"]).output().ok()?;
+    let flibs_output = crate::installer::r_command().args(["CMD", "config", "FLIBS"]).output().ok()?;
     let flibs = String::from_utf8_lossy(&flibs_output.stdout).trim().to_string();
 
     let bad_paths: Vec<String> = flibs

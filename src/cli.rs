@@ -54,7 +54,12 @@ pub enum Commands {
         packages: Vec<String>,
     },
 
-    /// Install packages (with pre-flight checks and parallel compilation)
+    /// Install one or more packages (with pre-flight checks and parallel compilation)
+    ///
+    /// Installs the named packages plus their dependencies, and records them in
+    /// rin.lock. Only the requested packages (and their deps) are built — an
+    /// unrelated broken package elsewhere in rin.lock won't block the install.
+    /// To (re)build the whole locked project instead, use `rin restore`.
     ///
     /// Example: rin install DESeq2
     /// Example: rin install --retry  (resume after fixing errors)
@@ -103,7 +108,12 @@ pub enum Commands {
         #[arg(required = true)]
         packages: Vec<String>,
     },
-    /// Restore packages from an rin.lock file
+    /// Rebuild the whole project: install/repair every package in rin.lock
+    ///
+    /// Unlike `rin install <pkg>` (which installs just one package + its deps),
+    /// restore builds everything recorded in rin.lock. Use it on a new machine,
+    /// after `git clone`, or to rebuild after fixing a broken dependency. This is
+    /// the command for reproducing an environment from a committed rin.lock.
     ///
     /// Example: rin restore
     Restore,
