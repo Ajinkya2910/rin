@@ -702,13 +702,21 @@ async fn cmd_install(
     maybe_fix_makevars()?;
 
     println!("\n{}", "Installing packages...".dimmed());
-    installer::install(&scoped, &registry.bioc_version).await?;
+    let built = installer::install(&scoped, &registry.bioc_version).await?;
 
-    println!(
-        "\n{} All {} packages installed successfully!",
-        "✓".green(),
-        scoped.packages.len()
-    );
+    // Tell the truth: only say "installed" when something was actually built.
+    if built == 0 {
+        println!(
+            "\n{} Already up to date — nothing to install.",
+            "✓".green()
+        );
+    } else {
+        println!(
+            "\n{} Installed {} package(s) successfully.",
+            "✓".green(),
+            built
+        );
+    }
 
     // Contextual nudge to `rin restore`: if the project (full resolved set) has
     // packages outside what we just installed that aren't built, the user has a

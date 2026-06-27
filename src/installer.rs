@@ -41,7 +41,7 @@ static EXCLUDE_CONDA: AtomicBool = AtomicBool::new(false);
 /// 1. Group packages into "tiers" — packages whose deps are all satisfied
 /// 2. Install each tier in parallel (within a tier, packages are independent)
 /// 3. Track progress for resume capability
-pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> {
+pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<usize> {
     use colored::Colorize;
 
     // Bug #46: ensure we have a writable install target before doing anything.
@@ -296,7 +296,9 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<()> 
         );
     }
 
-    Ok(())
+    // Return how many were actually built so callers can phrase their final
+    // line truthfully ("installed N" vs "already up to date").
+    Ok(new_count)
 }
 
 /// Install a single R package from source using R CMD INSTALL
