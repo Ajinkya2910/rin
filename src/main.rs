@@ -302,17 +302,10 @@ async fn cmd_install(
         }
     }
 
-    // Bug #55: on macOS without Homebrew, point users at the install command once.
-    if std::env::consts::OS == "macos" && !sysreq::has_brew() {
-        println!(
-            "{} Homebrew not detected. To enable rin's auto-install of system libraries:",
-            "ℹ".blue()
-        );
-        println!(
-            r#"  /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)""#
-        );
-        println!("  Then `rin install --retry`.\n");
-    }
+    // Note: the macOS "Homebrew not detected" guidance now fires contextually,
+    // only when a sysreq is actually missing and we'd have used brew to install
+    // it (see the advisory branch below). That avoids nagging on every install
+    // and lets the message name the specific libraries to `brew install`.
 
     // Parse package specs — registry names pass through, GitHub specs
     // get their metadata fetched and inserted into the registry below.
@@ -492,20 +485,49 @@ let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names
                 };
 
                 if can_auto_install {
-                    use std::io::{self, Write};
-                    let prompt = if std::env::consts::OS == "macos" {
-                        "brew install these now? [Y/n] "
+                    use std::io::{self, IsTerminal, Write};
+
+                    // Decide whether to auto-install the flagged libs. A
+                    // non-interactive console (RStudio, CI) can't answer a
+                    // [Y/n] prompt — reading its EOF stdin and treating it as
+                    // "yes" silently installs system packages behind a prompt
+                    // the user never actually saw. Instead, detect that case
+                    // up front (like decide_conda_exclusion does) and announce
+                    // the auto-install explicitly.
+                    let do_install = if io::stdin().is_terminal() {
+                        // Interactive: ask, default Yes.
+                        let prompt = if std::env::consts::OS == "macos" {
+                            "brew install these now? [Y/n] "
+                        } else {
+                            "install these now (may prompt for sudo password)? [Y/n] "
+                        };
+                        print!("\n  {} {}", "?".blue(), prompt);
+                        io::stdout().flush()?;
+
+                        let mut answer = String::new();
+                        io::stdin().read_line(&mut answer)?;
+                        let answer = answer.trim().to_lowercase();
+                        answer.is_empty() || answer == "y" || answer == "yes"
                     } else {
-                        "install these now (may prompt for sudo password)? [Y/n] "
+                        // Non-interactive: announce, then proceed (Option B).
+                        let how = if std::env::consts::OS == "macos" {
+                            "brew"
+                        } else {
+                            "the system package manager"
+                        };
+                        println!(
+                            "\n  {} Non-interactive session (RStudio/CI) — auto-installing the missing librar{} via {}:",
+                            "ℹ".blue(),
+                            if report.missing.len() == 1 { "y" } else { "ies" },
+                            how
+                        );
+                        for dep in &report.missing {
+                            println!("    {} {}", "+".dimmed(), dep.name.dimmed());
+                        }
+                        true
                     };
-                    print!("\n  {} {}", "?".blue(), prompt);
-                    io::stdout().flush()?;
 
-                    let mut answer = String::new();
-                    io::stdin().read_line(&mut answer)?;
-                    let answer = answer.trim().to_lowercase();
-
-                    if answer.is_empty() || answer == "y" || answer == "yes" {
+                    if do_install {
                         match sysreq::install_missing(&report) {
                             Ok(()) => println!("  {} install completed.", "✓".green()),
                             Err(e) => println!(
@@ -515,6 +537,35 @@ let resolved = sat_resolver::resolve_with_constraints(&mut registry, &root_names
                             ),
                         }
                     }
+                } else if std::env::consts::OS == "macos" && !sysreq::has_brew() {
+                    // brew is how rin auto-installs sysreqs on macOS; without it
+                    // we can't. Spell out exactly what to do — install brew, the
+                    // specific libraries, then retry — instead of leaving a new
+                    // user to decode a C compile error. Replaces the generic
+                    // "Homebrew not detected" startup notice (removed) with a
+                    // contextual one that names the actual missing libraries.
+                    let brew_pkgs: Vec<String> = report
+                        .missing
+                        .iter()
+                        .map(|d| sysreq::get_brew_name(&d.name))
+                        .collect();
+                    let plural = if brew_pkgs.len() == 1 { "y" } else { "ies" };
+                    println!(
+                        "\n  {} Homebrew isn't installed, so rin can't auto-install these for you.",
+                        "⚠".yellow()
+                    );
+                    println!("    To fix:");
+                    println!("      1. Install Homebrew:");
+                    println!(
+                        r#"           /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)""#
+                    );
+                    println!("      2. Install the librar{}:", plural);
+                    println!("           brew install {}", brew_pkgs.join(" "));
+                    println!(
+                        "      3. Resume:  {}   (or {} in RStudio)",
+                        "rin install --retry".bold(),
+                        "rin::install(retry=TRUE)".bold()
+                    );
                 }
 
                 println!(
