@@ -44,18 +44,18 @@ static EXCLUDE_CONDA: AtomicBool = AtomicBool::new(false);
 pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<usize> {
     use colored::Colorize;
 
-    // Bug #46: ensure we have a writable install target before doing anything.
-    // On HPC, R's default library is often the shared module install (read-only).
-    // If so, auto-create .rin/lib so the install lands somewhere the user owns.
+    // Isolate by default: install into a project-local .rin/lib rather than R's
+    // shared system/user library, so projects can't clobber each other's pinned
+    // versions (and the base R install is never polluted).
     let auto_created = ensure_writable_library()?;
     if auto_created {
         println!(
-            "  {} System R library is read-only — created {} for this project.",
+            "  {} Created {} — this project's isolated library.",
             "ℹ".blue(),
             ".rin/lib".bold()
         );
         println!(
-            "    {} for a fully-configured environment with an activate script.",
+            "    {} for a named environment with an activate script.",
             "Run `rin venv` instead".dimmed()
         );
     }
@@ -1006,59 +1006,41 @@ fn get_venv_lib() -> Option<std::path::PathBuf> {
     None
 }
 
-/// Bug #46: ensure rin has a writable library before any install starts.
+/// Ensure rin has a project-local library to install into, before any install.
+///
+/// rin isolates by default: unless a venv is already active, every project
+/// installs into its own `.rin/lib` in the working directory. We deliberately
+/// never install into R's *default* library —
+///   - not the system/framework library: it's part of the R installation, is
+///     wiped on upgrade, and is shared by every R session — writing project
+///     packages there pollutes the base install; and
+///   - not a shared user library: that would break per-project reproducibility,
+///     since two projects can pin different versions of a package and whichever
+///     is installed second would silently clobber the first.
+///
+/// (Today the project library holds full copies. A future shared content-
+/// addressed cache will let projects link to one stored copy — isolation
+/// without the duplication. That's a transparent backend change: the default
+/// stays per-project, so it won't churn anyone's setup.)
 ///
 /// Decision tree:
 ///   1. A venv is already active (RIN_VENV set, or .rin/lib exists in CWD)
-///      → use it, no change. (get_venv_lib already handles this.)
-///   2. R's default library is writable
-///      → use it (preserves normal Linux/Mac dev experience).
-///   3. R's default library is read-only (typical HPC: shared module install)
-///      → auto-create .rin/lib in the current directory. get_venv_lib() will
-///        pick this up on every subsequent call, so the rest of the install
-///        pipeline needs no changes.
+///      → use it. (get_venv_lib already handles this.)
+///   2. Otherwise → create ./.rin/lib in the current directory and use it.
 ///
-/// Returns true if auto-creation happened — the caller prints a one-time notice.
+/// Returns true when it just created the project library, so the caller can
+/// print a one-time notice.
 fn ensure_writable_library() -> Result<bool> {
-    use std::io::Write;
-
-    // Case 1: venv already active. Nothing to do.
+    // Case 1: venv / project library already active. Nothing to do.
     if get_venv_lib().is_some() {
         return Ok(false);
     }
 
-    // Ask R for its default library path.
-    let r_default: Option<PathBuf> = r_command()
-        .args(["--vanilla", "--slave", "-e", "cat(.libPaths()[1])"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
-
-    // Case 2: test if R's default is writable by opening a probe file.
-    // This is more portable than checking Unix permissions and handles
-    // edge cases like read-only mounts and quota-exhausted directories.
-    if let Some(ref default_lib) = r_default {
-        let probe = default_lib.join(".rin-write-test");
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&probe)
-        {
-            let _ = f.write_all(b"ok");
-            let _ = std::fs::remove_file(&probe);
-            return Ok(false); // System library is writable — use it.
-        }
-    }
-
-    // Case 3: system library is read-only (or R is unavailable).
-    // Auto-create .rin/lib. get_venv_lib() will see it on the next call.
+    // Case 2: isolate by default — create this project's own library. We do not
+    // probe or fall back to R's default library (see the doc comment above).
     let auto_lib = PathBuf::from(".rin/lib");
     std::fs::create_dir_all(&auto_lib)
-        .context("Failed to create .rin/lib for fallback install location")?;
+        .context("Failed to create .rin/lib (project-local library)")?;
 
     Ok(true)
 }
