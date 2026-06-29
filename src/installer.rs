@@ -20,7 +20,7 @@
 use crate::resolver::{ResolvedDeps, ResolvedPackage};
 use anyhow::{Context, Result};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use indicatif::{ProgressBar, ProgressStyle};
@@ -84,6 +84,7 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<usiz
     let mut installed: HashSet<String> = HashSet::new();
     let mut failed: Vec<(String, String)> = Vec::new(); // (name, error)
     let mut retry_queue: HashSet<String> = HashSet::new();
+    let mut cached_count = 0usize; // of the newly-added packages, how many were linked from cache
     // Find packages already installed on this system. These are part of the
     // resolved closure but need no work — collapse them into one summary line
     // instead of one line each, so the packages we're *actually* installing
@@ -183,7 +184,7 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<usiz
         );
         pb.set_position((installed.len() - already_count) as u64);
 
-        let results: Vec<(String, Result<()>)> = ready
+        let results: Vec<(String, Result<Outcome>)> = ready
             .par_iter()
             .map(|pkg| {
                 pb.set_message(pkg.name.clone());
@@ -207,14 +208,23 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<usiz
         // Process results
         for (name, result) in results {
             match result {
-                Ok(()) => {
+                Ok(outcome) => {
+                    let tag = if outcome == Outcome::Cached {
+                        " (cached)".dimmed().to_string()
+                    } else {
+                        String::new()
+                    };
                     println!(
-                        "  {} {} {}",
+                        "  {} {} {}{}",
                         "✓".green(),
                         name,
                         format!("({}/{})", installed.len() + 1 - already_count, to_install)
-                            .dimmed()
+                            .dimmed(),
+                        tag
                     );
+                    if outcome == Outcome::Cached {
+                        cached_count += 1;
+                    }
                     installed.insert(name);
                 }
                 Err(e) => {
@@ -288,10 +298,16 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<usiz
     if new_count == 0 {
         println!("\n  {} Everything up to date.", "✓".green());
     } else {
+        let from_cache = if cached_count > 0 {
+            format!(" ({} from cache)", cached_count).dimmed().to_string()
+        } else {
+            String::new()
+        };
         println!(
-            "\n  {} Done. {} installed, {} up to date.",
+            "\n  {} Done. {} installed{}, {} up to date.",
             "✓".green(),
             new_count,
+            from_cache,
             already_count
         );
     }
@@ -301,14 +317,34 @@ pub async fn install(resolved: &ResolvedDeps, bioc_version: &str) -> Result<usiz
     Ok(new_count)
 }
 
+/// Whether a package was compiled this run or linked from the built-package cache.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Outcome {
+    Built,
+    Cached,
+}
+
 /// Install a single R package from source using R CMD INSTALL
-fn install_single_package(pkg: &ResolvedPackage, bioc_version: &str) -> Result<()> {
+fn install_single_package(pkg: &ResolvedPackage, bioc_version: &str) -> Result<Outcome> {
+    // The project library this package must end up in.
+    let project_lib = get_venv_lib();
+
     // GitHub packages: install from the cached tarball, skipping download.
+    // (Not yet routed through the built-package cache — keyed by SHA, follow-up.)
     if let Some(gh) = &pkg.github_source {
-        return install_from_github_tarball(pkg, gh);
+        return install_from_github_tarball(pkg, gh, project_lib.as_deref())
+            .map(|()| Outcome::Built);
     }
 
     // ── CRAN / Bioconductor path ──────────────────────────────────────────
+
+    // Built-package cache hit: link the prebuilt copy in, skip download+compile.
+    if let Some(lib) = project_lib.as_deref() {
+        if let Some(slot) = crate::cache::lookup(pkg) {
+            crate::cache::link_into_lib(&slot, lib, &pkg.name)?;
+            return Ok(Outcome::Cached);
+        }
+    }
 
     let download_dir = PathBuf::from("/tmp/rin-downloads");
     std::fs::create_dir_all(&download_dir)?;
@@ -367,8 +403,19 @@ fn install_single_package(pkg: &ResolvedPackage, bioc_version: &str) -> Result<(
         }
     }
 
-    run_r_cmd_install(&tarball_path, &pkg.name)?;
-    Ok(())
+    // Build into the cache (then link), so other projects can reuse it. If the
+    // cache is disabled this run, or we have no project lib, install directly.
+    match (project_lib.as_deref(), crate::cache::begin_build(pkg)?) {
+        (Some(lib), Some(staging)) => {
+            run_r_cmd_install(&tarball_path, &pkg.name, Some(&staging))?;
+            let slot = crate::cache::publish(pkg, &staging)?;
+            crate::cache::link_into_lib(&slot, lib, &pkg.name)?;
+        }
+        (lib, _) => {
+            run_r_cmd_install(&tarball_path, &pkg.name, lib)?;
+        }
+    }
+    Ok(Outcome::Built)
 }
 
 /// Build the ordered list of URLs to try for a CRAN/Bioc source tarball.
@@ -478,6 +525,7 @@ fn sha256_file(path: &PathBuf) -> Result<String> {
 fn install_from_github_tarball(
     pkg: &ResolvedPackage,
     gh: &crate::resolver::GitHubSource,
+    install_lib: Option<&Path>,
 ) -> Result<()> {
     let cache_dir = github_cache_dir()?;
     let tarball_path = cache_dir
@@ -513,7 +561,7 @@ fn install_from_github_tarball(
         gh.subdir.as_deref(),
     )?;
 
-    match run_r_cmd_install(&pkg_dir, &pkg.name) {
+    match run_r_cmd_install(&pkg_dir, &pkg.name, install_lib) {
         Ok(()) => {
             let _ = std::fs::remove_dir_all(&tmp_extract);
             Ok(())
@@ -734,8 +782,8 @@ pub fn r_command() -> Command {
 
 /// Run `R CMD INSTALL` against a tarball OR an extracted package directory.
 /// R CMD INSTALL accepts both — that's why this helper works for both paths.
-fn run_r_cmd_install(target: &PathBuf, pkg_name: &str) -> Result<()> {
-    let lib_arg = get_venv_lib().map(|p| format!("--library={}", p.display()));
+fn run_r_cmd_install(target: &Path, pkg_name: &str, install_lib: Option<&Path>) -> Result<()> {
+    let lib_arg = install_lib.map(|p| format!("--library={}", p.display()));
 
     let mut cmd = r_command();
     cmd.args(["CMD", "INSTALL", "--no-test-load"]);

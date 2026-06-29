@@ -17,6 +17,7 @@ mod resolver;   // Dependency resolution (the brain of rin)
 mod sysreq;     // System dependency checking (apt packages)
 mod lockfile;   // rin.lock file generation and reading
 mod installer;  // Package installation orchestration
+mod cache;      // Built-package cache (link instead of recompile across projects)
 mod version;
 mod sat_resolver;
 mod source;
@@ -75,6 +76,11 @@ async fn main() -> Result<()> {
         cli::Commands::VenvRemove { path } => {
             cmd_venv_remove(&path)?;
         }
+        cli::Commands::Cache { action } => match action {
+            cli::CacheCommands::Dir => {
+                println!("{}", cache::cache_root().display());
+            }
+        },
     }
 
     // Ok(()) means "everything succeeded, return nothing."

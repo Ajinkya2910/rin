@@ -141,5 +141,22 @@ pub enum Commands {
         #[arg(default_value = ".rin")]
         path: String,
     },
+
+    /// Inspect the built-package cache
+    ///
+    /// rin stores each compiled package once and links it into each project,
+    /// so isolated projects don't recompile shared packages.
+    ///
+    /// Example: rin cache dir
+    Cache {
+        #[command(subcommand)]
+        action: CacheCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum CacheCommands {
+    /// Print the built-package cache directory
+    Dir,
 }
 
