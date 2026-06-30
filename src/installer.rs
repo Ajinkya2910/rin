@@ -407,12 +407,14 @@ fn install_single_package(pkg: &ResolvedPackage, bioc_version: &str) -> Result<O
     // cache is disabled this run, or we have no project lib, install directly.
     match (project_lib.as_deref(), crate::cache::begin_build(pkg)?) {
         (Some(lib), Some(staging)) => {
-            run_r_cmd_install(&tarball_path, &pkg.name, Some(&staging))?;
+            // Install into the cache staging dir, but resolve deps from the venv.
+            run_r_cmd_install(&tarball_path, &pkg.name, Some(&staging), Some(lib))?;
             let slot = crate::cache::publish(pkg, &staging)?;
             crate::cache::link_into_lib(&slot, lib, &pkg.name)?;
         }
         (lib, _) => {
-            run_r_cmd_install(&tarball_path, &pkg.name, lib)?;
+            // Direct install: --library is the venv, so deps resolve there already.
+            run_r_cmd_install(&tarball_path, &pkg.name, lib, None)?;
         }
     }
     Ok(Outcome::Built)
@@ -561,7 +563,7 @@ fn install_from_github_tarball(
         gh.subdir.as_deref(),
     )?;
 
-    match run_r_cmd_install(&pkg_dir, &pkg.name, install_lib) {
+    match run_r_cmd_install(&pkg_dir, &pkg.name, install_lib, None) {
         Ok(()) => {
             let _ = std::fs::remove_dir_all(&tmp_extract);
             Ok(())
@@ -782,7 +784,20 @@ pub fn r_command() -> Command {
 
 /// Run `R CMD INSTALL` against a tarball OR an extracted package directory.
 /// R CMD INSTALL accepts both — that's why this helper works for both paths.
-fn run_r_cmd_install(target: &Path, pkg_name: &str, install_lib: Option<&Path>) -> Result<()> {
+///
+/// `install_lib` is where the package is written (`--library`). `dep_lib` is the
+/// project library to make visible *for dependency resolution* during the build
+/// (via `R_LIBS`). These differ when building into the cache: the package is
+/// installed into an empty cache staging dir, but its dependencies live in the
+/// project's venv — without `dep_lib` the build can't see them and either fails
+/// ("dependency X not available") or loads a stale version from the system
+/// library (so a newer-version requirement then fails to load).
+fn run_r_cmd_install(
+    target: &Path,
+    pkg_name: &str,
+    install_lib: Option<&Path>,
+    dep_lib: Option<&Path>,
+) -> Result<()> {
     let lib_arg = install_lib.map(|p| format!("--library={}", p.display()));
 
     let mut cmd = r_command();
@@ -791,6 +806,18 @@ fn run_r_cmd_install(target: &Path, pkg_name: &str, install_lib: Option<&Path>) 
         cmd.arg(lib);
     }
     cmd.arg(target);
+
+    // Make the project library visible for dependency resolution. R searches
+    // R_LIBS before the system library, so the venv's (correct) versions win
+    // over any older copies sitting in the framework library.
+    if let Some(dep) = dep_lib {
+        let prefix = dep.display().to_string();
+        let combined = match std::env::var("R_LIBS") {
+            Ok(existing) if !existing.is_empty() => format!("{}:{}", prefix, existing),
+            _ => prefix,
+        };
+        cmd.env("R_LIBS", combined);
+    }
 
     if EXCLUDE_CONDA.load(Ordering::Relaxed) {
         // User opted to build conda-free: strip conda from the subprocess env
